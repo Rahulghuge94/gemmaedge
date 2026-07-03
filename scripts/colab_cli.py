@@ -80,7 +80,7 @@ def poll_task(task_id: str, server_url: str):
 def sync_repository():
     print("Syncing local repository with remote Colab...")
     zip_buffer = io.BytesIO()
-    include_dirs = ["include", "src", "tests", "scripts"]
+    include_dirs = ["include", "src", "tests", "scripts", "tools"]
     include_files = ["CMakeLists.txt", "CMakePresets.json", "README.md"]
     
     try:

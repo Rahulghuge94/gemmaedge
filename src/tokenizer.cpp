@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <iostream>
 #include <limits>
 #include <stdexcept>
 
@@ -78,6 +79,11 @@ Gemma4Tokenizer::Gemma4Tokenizer(
               [](const auto& a, const auto& b) {
                   return a.size() > b.size();
               });
+
+    std::cout << "[Tokenizer Info] Special tokens count: " << special_tokens_.size() << std::endl;
+    for (std::size_t i = 0; i < special_tokens_.size(); ++i) {
+        std::cout << "  Special token " << i << ": " << special_tokens_[i] << std::endl;
+    }
 
     for (std::uint32_t rank = 0; rank < merges.size(); ++rank) {
         const auto split = merges[rank].find(' ');

@@ -8,7 +8,10 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-add_library(gemmaedge_core
+# Check and enable CUDA optionally
+enable_language(CUDA OPTIONAL)
+
+set(GEMMAEDGE_SOURCES
     src/model_format.cpp
     src/expert_cache.cpp
     src/kv_store.cpp
@@ -23,6 +26,20 @@ add_library(gemmaedge_core
     src/generation.cpp
     src/vulkan_backend.cpp
 )
+
+if(CMAKE_CUDA_COMPILER)
+    list(APPEND GEMMAEDGE_SOURCES src/cuda_backend.cu)
+    message(STATUS "CUDA compilation enabled.")
+else()
+    list(APPEND GEMMAEDGE_SOURCES src/cuda_backend_stub.cpp)
+    message(STATUS "CUDA compilation disabled, compiling CPU stub.")
+endif()
+
+add_library(gemmaedge_core ${GEMMAEDGE_SOURCES})
+if(CMAKE_CUDA_COMPILER)
+    set_target_properties(gemmaedge_core PROPERTIES CUDA_STANDARD 17)
+    target_compile_definitions(gemmaedge_core PRIVATE GEMMAEDGE_USE_CUDA=1)
+endif()
 target_include_directories(gemmaedge_core PUBLIC include)
 target_compile_definitions(gemmaedge_core PUBLIC
     $<$<PLATFORM_ID:Android>:GEMMAEDGE_ANDROID=1>

@@ -1,5 +1,6 @@
 #include "gemmaedge/tensor.h"
 #include "gemmaedge/vulkan_backend.h"
+#include "gemmaedge/cuda_backend.h"
 
 #include <algorithm>
 #include <cmath>
@@ -345,46 +346,79 @@ inline float dot_q4k_neon(const BlockQ4K& block, const float* x) {
         float32x4_t f2_vec = vdupq_n_f32(factor2);
         float32x4_t b2_vec = vdupq_n_f32(bias2);
 
-        uint8x16_t packed = vld1q_u8(q);
+        uint8x16_t packed0 = vld1q_u8(q);
+        uint8x16_t packed1 = vld1q_u8(q + 16);
         uint8x16_t mask = vdupq_n_u8(0x0F);
-        uint8x16_t low_nibbles = vandq_u8(packed, mask);
-        uint8x16_t high_nibbles = vshrq_n_u8(packed, 4);
 
-        uint16x8_t low_lo = vmovl_u8(vget_low_u8(low_nibbles));
-        uint16x8_t low_hi = vmovl_u8(vget_high_u8(low_nibbles));
+        uint8x16_t low_nibbles0 = vandq_u8(packed0, mask);
+        uint8x16_t high_nibbles0 = vshrq_n_u8(packed0, 4);
 
-        float32x4_t l0 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(low_lo)));
-        float32x4_t l1 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(low_lo)));
-        float32x4_t l2 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(low_hi)));
-        float32x4_t l3 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(low_hi)));
+        uint8x16_t low_nibbles1 = vandq_u8(packed1, mask);
+        uint8x16_t high_nibbles1 = vshrq_n_u8(packed1, 4);
 
+        uint16x8_t low_lo0 = vmovl_u8(vget_low_u8(low_nibbles0));
+        uint16x8_t low_hi0 = vmovl_u8(vget_high_u8(low_nibbles0));
+        float32x4_t l0 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(low_lo0)));
+        float32x4_t l1 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(low_lo0)));
+        float32x4_t l2 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(low_hi0)));
+        float32x4_t l3 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(low_hi0)));
         l0 = vmlaq_f32(b1_vec, l0, f1_vec);
         l1 = vmlaq_f32(b1_vec, l1, f1_vec);
         l2 = vmlaq_f32(b1_vec, l2, f1_vec);
         l3 = vmlaq_f32(b1_vec, l3, f1_vec);
 
-        uint16x8_t high_lo = vmovl_u8(vget_low_u8(high_nibbles));
-        uint16x8_t high_hi = vmovl_u8(vget_high_u8(high_nibbles));
+        uint16x8_t low_lo1 = vmovl_u8(vget_low_u8(low_nibbles1));
+        uint16x8_t low_hi1 = vmovl_u8(vget_high_u8(low_nibbles1));
+        float32x4_t l4 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(low_lo1)));
+        float32x4_t l5 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(low_lo1)));
+        float32x4_t l6 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(low_hi1)));
+        float32x4_t l7 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(low_hi1)));
+        l4 = vmlaq_f32(b1_vec, l4, f1_vec);
+        l5 = vmlaq_f32(b1_vec, l5, f1_vec);
+        l6 = vmlaq_f32(b1_vec, l6, f1_vec);
+        l7 = vmlaq_f32(b1_vec, l7, f1_vec);
 
-        float32x4_t h0 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(high_lo)));
-        float32x4_t h1 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(high_lo)));
-        float32x4_t h2 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(high_hi)));
-        float32x4_t h3 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(high_hi)));
-
+        uint16x8_t high_lo0 = vmovl_u8(vget_low_u8(high_nibbles0));
+        uint16x8_t high_hi0 = vmovl_u8(vget_high_u8(high_nibbles0));
+        float32x4_t h0 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(high_lo0)));
+        float32x4_t h1 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(high_lo0)));
+        float32x4_t h2 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(high_hi0)));
+        float32x4_t h3 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(high_hi0)));
         h0 = vmlaq_f32(b2_vec, h0, f2_vec);
         h1 = vmlaq_f32(b2_vec, h1, f2_vec);
         h2 = vmlaq_f32(b2_vec, h2, f2_vec);
         h3 = vmlaq_f32(b2_vec, h3, f2_vec);
+
+        uint16x8_t high_lo1 = vmovl_u8(vget_low_u8(high_nibbles1));
+        uint16x8_t high_hi1 = vmovl_u8(vget_high_u8(high_nibbles1));
+        float32x4_t h4 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(high_lo1)));
+        float32x4_t h5 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(high_lo1)));
+        float32x4_t h6 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(high_hi1)));
+        float32x4_t h7 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(high_hi1)));
+        h4 = vmlaq_f32(b2_vec, h4, f2_vec);
+        h5 = vmlaq_f32(b2_vec, h5, f2_vec);
+        h6 = vmlaq_f32(b2_vec, h6, f2_vec);
+        h7 = vmlaq_f32(b2_vec, h7, f2_vec);
 
         sum_vec = vmlaq_f32(sum_vec, l0, vld1q_f32(x + base));
         sum_vec = vmlaq_f32(sum_vec, l1, vld1q_f32(x + base + 4));
         sum_vec = vmlaq_f32(sum_vec, l2, vld1q_f32(x + base + 8));
         sum_vec = vmlaq_f32(sum_vec, l3, vld1q_f32(x + base + 12));
 
+        sum_vec = vmlaq_f32(sum_vec, l4, vld1q_f32(x + base + 16));
+        sum_vec = vmlaq_f32(sum_vec, l5, vld1q_f32(x + base + 20));
+        sum_vec = vmlaq_f32(sum_vec, l6, vld1q_f32(x + base + 24));
+        sum_vec = vmlaq_f32(sum_vec, l7, vld1q_f32(x + base + 28));
+
         sum_vec = vmlaq_f32(sum_vec, h0, vld1q_f32(x + base + 32));
         sum_vec = vmlaq_f32(sum_vec, h1, vld1q_f32(x + base + 36));
         sum_vec = vmlaq_f32(sum_vec, h2, vld1q_f32(x + base + 40));
         sum_vec = vmlaq_f32(sum_vec, h3, vld1q_f32(x + base + 44));
+
+        sum_vec = vmlaq_f32(sum_vec, h4, vld1q_f32(x + base + 48));
+        sum_vec = vmlaq_f32(sum_vec, h5, vld1q_f32(x + base + 52));
+        sum_vec = vmlaq_f32(sum_vec, h6, vld1q_f32(x + base + 56));
+        sum_vec = vmlaq_f32(sum_vec, h7, vld1q_f32(x + base + 60));
 
         q += 32;
     }
@@ -452,6 +486,12 @@ void ggml_matvec(GgmlType type, const void* matrix, std::size_t rows,
                  std::size_t cols, const float* vector, float* output) {
     if (!matrix || !vector || !output)
         throw std::invalid_argument("null GGML matvec input");
+
+    if (is_cuda_available()) {
+        if (cuda_matvec(type, matrix, rows, cols, vector, output)) {
+            return;
+        }
+    }
 
     if (is_vulkan_available()) {
         if (vulkan_matvec(matrix, rows, cols, vector, output)) {

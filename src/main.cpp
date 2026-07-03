@@ -10,6 +10,7 @@
 #include <iomanip>
 #include <iostream>
 #include <cstdlib>
+#include <chrono>
 
 int main(int argc, char** argv) {
     try {
@@ -111,10 +112,18 @@ int main(int argc, char** argv) {
             if (argc == 5)
                 config.max_new_tokens = static_cast<std::uint32_t>(
                     std::max(1, std::atoi(argv[4])));
+             std::cout << "Starting prefill/generation with " << prompt.size() << " prompt tokens:" << std::endl;
+             for (std::size_t i = 0; i < prompt.size(); ++i) {
+                 std::cout << "  Prompt Token " << i << " (ID " << prompt[i] << "): '"
+                           << tokenizer.decode(prompt[i], true) << "'" << std::endl;
+             }
+            const auto start_time = std::chrono::steady_clock::now();
             session.generate(prompt, config, [&](gemmaedge::TokenId token) {
-                std::cout << tokenizer.decode(token, false) << std::flush;
+                std::cout << "\n[Token " << token << "]: " << tokenizer.decode(token, true) << std::flush;
             });
-            std::cout << '\n';
+            const auto end_time = std::chrono::steady_clock::now();
+            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+            std::cout << "\nGeneration completed in " << elapsed << " ms.\n";
             return 0;
         }
         std::cout << "GemmaEdge 0.1 storage-core\n"

@@ -1,6 +1,7 @@
 #include "gemmaedge/gemma4_model.h"
 
 #include <stdexcept>
+#include <iostream>
 
 namespace gemmaedge {
 namespace {
@@ -64,6 +65,16 @@ Gemma4Model::Gemma4Model(const GgufFile& gguf) : gguf_(gguf) {
     if (config_.layer_count != 30 || config_.hidden_size != 2816 ||
         config_.expert_count != 128 || config_.experts_used != 8)
         throw std::runtime_error("GGUF is not Gemma 4 26B A4B");
+
+    std::cout << "[Model Info] Config Loaded:"
+              << "\n  layers: " << config_.layer_count
+              << "\n  hidden_size: " << config_.hidden_size
+              << "\n  attention_heads: " << config_.attention_heads
+              << "\n  sliding_window: " << config_.sliding_window
+              << "\n  local_head_dim: " << config_.local_head_dim
+              << "\n  global_head_dim: " << config_.global_head_dim
+              << "\n  vocab_size: " << config_.vocab_size
+              << std::endl;
 
     token_embedding_ = required("token_embd.weight");
     output_norm_ = required("output_norm.weight");
