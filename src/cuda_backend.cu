@@ -5,6 +5,9 @@
 #include <unordered_map>
 #include <mutex>
 #include <iostream>
+#if defined(__linux__) || defined(__APPLE__)
+#include <sys/mman.h>
+#endif
 
 namespace gemmaedge {
 namespace {
@@ -178,6 +181,13 @@ void* get_gpu_matrix(const void* host_ptr, std::size_t bytes) {
     void* dev_ptr = nullptr;
     if (cudaMalloc(&dev_ptr, bytes) == cudaSuccess) {
         if (cudaMemcpy(dev_ptr, host_ptr, bytes, cudaMemcpyHostToDevice) == cudaSuccess) {
+#if defined(__linux__) || defined(__APPLE__)
+            uintptr_t page_size = 4096;
+            uintptr_t addr = reinterpret_cast<uintptr_t>(host_ptr);
+            uintptr_t aligned_addr = addr & ~(page_size - 1);
+            uintptr_t aligned_size = (addr + bytes - aligned_addr + page_size - 1) & ~(page_size - 1);
+            madvise(reinterpret_cast<void*>(aligned_addr), aligned_size, MADV_DONTNEED);
+#endif
             g_gpu_weights[host_ptr] = dev_ptr;
             return dev_ptr;
         }

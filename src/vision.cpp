@@ -227,7 +227,7 @@ VisionOutput Gemma4VisionEncoder::encode(const RgbImage& image) {
             static_cast<std::uint32_t>(heads),
             static_cast<std::uint32_t>(heads),
             static_cast<std::uint32_t>(head_dim), 0,
-            1.0f / std::sqrt(static_cast<float>(head_dim))});
+            1.0f});
         for (std::size_t token = 0; token < tokens; ++token)
             full_attention.append(token, k.data() + token * hidden,
                                   v.data() + token * hidden);

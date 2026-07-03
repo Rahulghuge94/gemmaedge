@@ -105,7 +105,7 @@ Gemma4Session::Gemma4Session(
     for (std::uint32_t layer = 0; layer < config.layer_count; ++layer) {
         const bool sliding = config.sliding_layers[layer];
         const auto head_dim = sliding ? config.local_head_dim : config.global_head_dim;
-        const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+        const float scale = 1.0f;
         kv_.push_back(std::make_unique<LayerKvCache>(AttentionConfig{
             config.attention_heads, config.kv_heads[layer],
             head_dim, sliding ? config.sliding_window : 0, scale}));
