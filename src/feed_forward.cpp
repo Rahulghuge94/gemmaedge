@@ -1,5 +1,6 @@
 #include "gemmaedge/feed_forward.h"
 
+#include "gemmaedge/generation.h"
 #include "gemmaedge/tensor.h"
 
 #include <algorithm>
@@ -103,6 +104,7 @@ Gemma4FeedForward::load_expert(const ExpertKey& key) const {
     return ExpertCache::Bytes(source, source + slice_bytes);
 }
 
+// Original forward() — allocates scratch vectors per call (backward compat).
 void Gemma4FeedForward::forward(
     std::uint32_t layer_index, const float* input, float* output,
     std::vector<RoutedExpert>* routing) {
@@ -179,5 +181,73 @@ void Gemma4FeedForward::forward(
         output[i] = (input[i] + combined[i]) * layer_scale;
 }
 
-} // namespace gemmaedge
+// Scratch-based forward() — uses pre-allocated ScratchArena buffers.
+void Gemma4FeedForward::forward(
+    std::uint32_t layer_index, const float* input, float* output,
+    ScratchArena& s, std::vector<RoutedExpert>* routing) {
+    if (!input || !output || layer_index >= model_.layers().size())
+        throw std::invalid_argument("invalid feed-forward invocation");
+    const auto& config = model_.config();
+    const auto& layer = model_.layers()[layer_index];
+    const std::size_t hidden = config.hidden_size;
+    const std::size_t dense_size = config.dense_intermediate;
+    const std::size_t expert_size = config.expert_intermediate;
 
+    rms_norm(input, f32_data(*layer.ffn_norm), hidden, config.rms_epsilon,
+             s.dense_input.data());
+    matvec(*layer.dense_gate, s.dense_input.data(), s.dense_gate.data());
+    matvec(*layer.dense_up, s.dense_input.data(), s.dense_up.data());
+    for (std::size_t i = 0; i < dense_size; ++i)
+        s.dense_gate[i] = gelu_tanh(s.dense_gate[i]) * s.dense_up[i];
+    matvec(*layer.dense_down, s.dense_gate.data(), s.dense_output.data());
+    rms_norm(s.dense_output.data(), f32_data(*layer.post_dense_norm), hidden,
+             config.rms_epsilon, s.dense_output.data());
+
+    const auto selected = route_top_k(
+        input, hidden, f32_data(*layer.router_scale),
+        f32_data(*layer.router), config.expert_count, config.experts_used,
+        f32_data(*layer.expert_output_scale), config.rms_epsilon);
+    if (routing) *routing = selected;
+
+    rms_norm(input, f32_data(*layer.pre_expert_norm), hidden,
+             config.rms_epsilon, s.expert_input.data());
+    std::fill(s.expert_sum.begin(),
+              s.expert_sum.begin() + static_cast<std::ptrdiff_t>(hidden), 0.0f);
+
+    for (const auto& selected_expert : selected) {
+        const ExpertKey gate_key{layer_index, selected_expert.expert,
+                                 TensorRole::ExpertGateUp};
+        const ExpertKey down_key{layer_index, selected_expert.expert,
+                                 TensorRole::ExpertDown};
+        const auto gate_bytes =
+            expert_cache_.get(gate_key, selected_expert.probability);
+        const auto down_bytes =
+            expert_cache_.get(down_key, selected_expert.probability);
+
+        ggml_matvec(layer.expert_gate_up->type, gate_bytes->data(),
+                    expert_size * 2, hidden, s.expert_input.data(),
+                    s.gate_up.data());
+        for (std::size_t i = 0; i < expert_size; ++i)
+            s.activated[i] = gelu_tanh(s.gate_up[i]) *
+                             s.gate_up[expert_size + i];
+        ggml_matvec(layer.expert_down->type, down_bytes->data(), hidden,
+                    expert_size, s.activated.data(), s.expert_output.data());
+        for (std::size_t i = 0; i < hidden; ++i)
+            s.expert_sum[i] += selected_expert.weight * s.expert_output[i];
+    }
+    rms_norm(s.expert_sum.data(), f32_data(*layer.post_expert_norm), hidden,
+             config.rms_epsilon, s.expert_sum.data());
+
+    for (std::size_t i = 0; i < hidden; ++i)
+        s.combined[i] = s.dense_output[i] + s.expert_sum[i];
+    rms_norm(s.combined.data(), f32_data(*layer.post_ffn_norm), hidden,
+             config.rms_epsilon, s.combined.data());
+
+    float layer_scale = 1.0f;
+    if (layer.layer_scale)
+        layer_scale = f32_data(*layer.layer_scale)[0];
+    for (std::size_t i = 0; i < hidden; ++i)
+        output[i] = (input[i] + s.combined[i]) * layer_scale;
+}
+
+} // namespace gemmaedge

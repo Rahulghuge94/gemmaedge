@@ -14,6 +14,33 @@
 
 namespace gemmaedge {
 
+// Pre-allocated workspace that lives for the lifetime of a session, avoiding
+// per-token heap churn.  Sized once at construction from the model config.
+struct ScratchArena {
+    // Attention scratch
+    std::vector<float> normalized;
+    std::vector<float> q;
+    std::vector<float> k;
+    std::vector<float> v;
+    std::vector<float> attended;
+    std::vector<float> projected;
+    std::vector<float> layer_output;
+
+    // FFN scratch
+    std::vector<float> dense_input;
+    std::vector<float> dense_gate;
+    std::vector<float> dense_up;
+    std::vector<float> dense_output;
+    std::vector<float> expert_input;
+    std::vector<float> expert_sum;
+    std::vector<float> gate_up;
+    std::vector<float> activated;
+    std::vector<float> expert_output;
+    std::vector<float> combined;
+
+    void resize(const Gemma4Config& config);
+};
+
 struct SamplingConfig {
     float temperature{1.0f};
     std::uint32_t top_k{64};
@@ -68,6 +95,7 @@ private:
     std::vector<std::unique_ptr<LayerKvCache>> kv_;
     std::vector<float> logits_;
     std::uint64_t position_{0};
+    ScratchArena scratch_;
 };
 
 } // namespace gemmaedge

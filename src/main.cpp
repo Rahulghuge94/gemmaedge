@@ -105,7 +105,7 @@ int main(int argc, char** argv) {
             gemmaedge::Gemma4Tokenizer tokenizer(file);
             gemmaedge::MappedFile weights(argv[2]);
             gemmaedge::Gemma4Session session(
-                model, weights, 512ULL * 1024ULL * 1024ULL);
+                model, weights, 256ULL * 1024ULL * 1024ULL);
             const auto prompt = tokenizer.encode(argv[3], true, true);
             gemmaedge::GenerationConfig config;
             if (argc == 5)

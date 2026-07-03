@@ -31,6 +31,12 @@ public:
     void forward(std::uint32_t layer, const float* input, float* output,
                  std::vector<RoutedExpert>* routing = nullptr);
 
+    // Same as above but uses pre-allocated scratch buffers from a ScratchArena
+    // to avoid per-call heap allocations (critical for mobile).
+    void forward(std::uint32_t layer, const float* input, float* output,
+                 struct ScratchArena& scratch,
+                 std::vector<RoutedExpert>* routing = nullptr);
+
     const ExpertCacheStats& cache_stats() const noexcept {
         return expert_cache_.stats();
     }

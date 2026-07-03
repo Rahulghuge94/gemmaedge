@@ -10,6 +10,39 @@
 
 namespace gemmaedge {
 
+void ScratchArena::resize(const Gemma4Config& config) {
+    const std::size_t hidden = config.hidden_size;
+    const std::size_t max_head_dim = std::max(config.local_head_dim,
+                                               config.global_head_dim);
+    const std::size_t max_query_values =
+        static_cast<std::size_t>(config.attention_heads) * max_head_dim;
+    std::size_t max_kv_values = 0;
+    for (auto heads : config.kv_heads)
+        max_kv_values = std::max(max_kv_values,
+                                 static_cast<std::size_t>(heads) * max_head_dim);
+    const std::size_t dense_size = config.dense_intermediate;
+    const std::size_t expert_size = config.expert_intermediate;
+
+    normalized.resize(hidden);
+    q.resize(max_query_values);
+    k.resize(max_kv_values);
+    v.resize(max_kv_values);
+    attended.resize(max_query_values);
+    projected.resize(hidden);
+    layer_output.resize(hidden);
+
+    dense_input.resize(hidden);
+    dense_gate.resize(dense_size);
+    dense_up.resize(dense_size);
+    dense_output.resize(hidden);
+    expert_input.resize(hidden);
+    expert_sum.resize(hidden);
+    gate_up.resize(expert_size * 2);
+    activated.resize(expert_size);
+    expert_output.resize(hidden);
+    combined.resize(hidden);
+}
+
 TokenId sample_token(const std::vector<float>& logits,
                      const SamplingConfig& config,
                      std::mt19937_64& random) {
@@ -77,6 +110,7 @@ Gemma4Session::Gemma4Session(
             config.attention_heads, config.kv_heads[layer],
             head_dim, sliding ? config.sliding_window : 0, scale}));
     }
+    scratch_.resize(config);
 }
 
 const std::uint8_t*
@@ -124,13 +158,7 @@ Gemma4Session::evaluate_embedding(const float* embedding) {
 
 const std::vector<float>& Gemma4Session::forward(float* hidden) {
     const auto& config = model_.config();
-    std::vector<float> normalized(config.hidden_size);
-    std::vector<float> q;
-    std::vector<float> k;
-    std::vector<float> v;
-    std::vector<float> attended;
-    std::vector<float> projected(config.hidden_size);
-    std::vector<float> layer_output(config.hidden_size);
+    auto& s = scratch_;
 
     const float* global_factors = nullptr;
     if (model_.rope_frequencies())
@@ -142,57 +170,51 @@ const std::vector<float>& Gemma4Session::forward(float* hidden) {
         const bool sliding = config.sliding_layers[layer_index];
         const std::size_t head_dim =
             sliding ? config.local_head_dim : config.global_head_dim;
-        const std::size_t query_values =
-            static_cast<std::size_t>(config.attention_heads) * head_dim;
         const std::size_t kv_values =
             static_cast<std::size_t>(config.kv_heads[layer_index]) * head_dim;
-        q.resize(query_values);
-        k.resize(kv_values);
-        v.resize(kv_values);
-        attended.resize(query_values);
 
         rms_norm(hidden, f32_data(*layer.attention_norm), config.hidden_size,
-                 config.rms_epsilon, normalized.data());
-        matvec(*layer.q, normalized.data(), q.data());
-        matvec(*layer.k, normalized.data(), k.data());
-        if (layer.v) matvec(*layer.v, normalized.data(), v.data());
-        else std::copy(k.begin(), k.end(), v.begin());
+                 config.rms_epsilon, s.normalized.data());
+        matvec(*layer.q, s.normalized.data(), s.q.data());
+        matvec(*layer.k, s.normalized.data(), s.k.data());
+        if (layer.v) matvec(*layer.v, s.normalized.data(), s.v.data());
+        else std::copy(s.k.data(), s.k.data() + kv_values, s.v.data());
 
         for (std::uint32_t head = 0; head < config.attention_heads; ++head)
-            rms_norm(q.data() + static_cast<std::size_t>(head) * head_dim,
+            rms_norm(s.q.data() + static_cast<std::size_t>(head) * head_dim,
                      f32_data(*layer.q_norm), head_dim, config.rms_epsilon,
-                     q.data() + static_cast<std::size_t>(head) * head_dim);
+                     s.q.data() + static_cast<std::size_t>(head) * head_dim);
         for (std::uint32_t head = 0;
              head < config.kv_heads[layer_index]; ++head) {
-            rms_norm(k.data() + static_cast<std::size_t>(head) * head_dim,
+            rms_norm(s.k.data() + static_cast<std::size_t>(head) * head_dim,
                      f32_data(*layer.k_norm), head_dim, config.rms_epsilon,
-                     k.data() + static_cast<std::size_t>(head) * head_dim);
-            rms_norm(v.data() + static_cast<std::size_t>(head) * head_dim,
+                     s.k.data() + static_cast<std::size_t>(head) * head_dim);
+            rms_norm(s.v.data() + static_cast<std::size_t>(head) * head_dim,
                      nullptr, head_dim, config.rms_epsilon,
-                     v.data() + static_cast<std::size_t>(head) * head_dim);
+                     s.v.data() + static_cast<std::size_t>(head) * head_dim);
         }
 
         const float rope_base =
             sliding ? config.local_rope_base : config.global_rope_base;
         const float* factors = sliding ? nullptr : global_factors;
-        apply_rope(q.data(), config.attention_heads, head_dim, head_dim,
+        apply_rope(s.q.data(), config.attention_heads, head_dim, head_dim,
                    position_, rope_base, factors);
-        apply_rope(k.data(), config.kv_heads[layer_index], head_dim, head_dim,
+        apply_rope(s.k.data(), config.kv_heads[layer_index], head_dim, head_dim,
                    position_, rope_base, factors);
-        kv_[layer_index]->append(position_, k.data(), v.data());
-        kv_[layer_index]->attend(q.data(), attended.data());
-        matvec(*layer.attention_output, attended.data(), projected.data());
-        rms_norm(projected.data(), f32_data(*layer.post_attention_norm),
-                 config.hidden_size, config.rms_epsilon, projected.data());
+        kv_[layer_index]->append(position_, s.k.data(), s.v.data());
+        kv_[layer_index]->attend(s.q.data(), s.attended.data());
+        matvec(*layer.attention_output, s.attended.data(), s.projected.data());
+        rms_norm(s.projected.data(), f32_data(*layer.post_attention_norm),
+                 config.hidden_size, config.rms_epsilon, s.projected.data());
         for (std::size_t i = 0; i < config.hidden_size; ++i)
-            layer_output[i] = hidden[i] + projected[i];
+            s.layer_output[i] = hidden[i] + s.projected[i];
 
-        feed_forward_.forward(layer_index, layer_output.data(), hidden);
+        feed_forward_.forward(layer_index, s.layer_output.data(), hidden, s);
     }
 
     rms_norm(hidden, f32_data(model_.output_norm()), config.hidden_size,
-             config.rms_epsilon, normalized.data());
-    matvec(model_.output(), normalized.data(), logits_.data());
+             config.rms_epsilon, s.normalized.data());
+    matvec(model_.output(), s.normalized.data(), logits_.data());
     if (config.final_logit_softcap > 0.0f) {
         for (float& logit : logits_)
             logit = config.final_logit_softcap *
