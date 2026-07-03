@@ -12,8 +12,8 @@ std::size_t ExpertKeyHash::operator()(const ExpertKey& key) const noexcept {
     return h;
 }
 
-ExpertCache::ExpertCache(std::uint64_t byte_budget, Loader loader)
-    : byte_budget_(byte_budget), loader_(std::move(loader)) {
+ExpertCache::ExpertCache(std::uint64_t byte_budget, Loader loader, Evictor evictor)
+    : byte_budget_(byte_budget), loader_(std::move(loader)), evictor_(std::move(evictor)) {
     if (!loader_) throw std::invalid_argument("expert cache requires a loader");
 }
 
@@ -40,35 +40,38 @@ void ExpertCache::evict_until_fit(std::uint64_t incoming) {
             }
         }
         auto slot = slots_.find(*victim);
-        stats_.bytes_resident -= slot->second.bytes->size();
+        if (evictor_) {
+            evictor_(*victim, slot->second.view);
+        }
+        stats_.bytes_resident -= slot->second.view.size;
         slots_.erase(slot);
         lru_.erase(victim);
         ++stats_.evictions;
     }
 }
 
-std::shared_ptr<const ExpertCache::Bytes>
+ExpertView
 ExpertCache::get(const ExpertKey& key, float router_probability) {
     auto found = slots_.find(key);
     if (found != slots_.end()) {
         ++stats_.hits;
         touch(found->second, key, router_probability);
-        return found->second.bytes;
+        return found->second.view;
     }
 
     ++stats_.misses;
-    auto bytes = std::make_shared<Bytes>(loader_(key));
-    stats_.bytes_loaded += bytes->size();
-    if (bytes->size() > byte_budget_ || byte_budget_ == 0)
-        return bytes;
+    ExpertView view = loader_(key);
+    stats_.bytes_loaded += view.size;
+    if (view.size > byte_budget_ || byte_budget_ == 0)
+        return view;
 
-    evict_until_fit(bytes->size());
+    evict_until_fit(view.size);
     lru_.push_front(key);
-    Slot slot{bytes, std::max(0.0f, router_probability), lru_.begin()};
+    Slot slot{view, std::max(0.0f, router_probability), lru_.begin()};
     slots_.emplace(key, std::move(slot));
-    stats_.bytes_resident += bytes->size();
+    stats_.bytes_resident += view.size;
     ++stats_.admissions;
-    return bytes;
+    return view;
 }
 
 bool ExpertCache::contains(const ExpertKey& key) const {

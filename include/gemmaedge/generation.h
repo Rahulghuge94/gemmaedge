@@ -65,11 +65,11 @@ public:
                   std::uint64_t expert_cache_bytes);
 
     // Evaluates one language token and returns logits for the following token.
-    const std::vector<float>& evaluate(TokenId token);
+    const std::vector<float>& evaluate(TokenId token, bool skip_logits = false);
 
     // Evaluates an already projected 2816-wide embedding, used for image soft
     // tokens. Unlike token embeddings, it is not multiplied by sqrt(hidden).
-    const std::vector<float>& evaluate_embedding(const float* embedding);
+    const std::vector<float>& evaluate_embedding(const float* embedding, bool skip_logits = false);
 
     const std::vector<float>& prefill(const std::vector<TokenId>& prompt);
     std::vector<TokenId> generate(
@@ -83,7 +83,7 @@ public:
     }
 
 private:
-    const std::vector<float>& forward(float* hidden);
+    const std::vector<float>& forward(float* hidden, bool skip_logits = false);
     const std::uint8_t* tensor_data(const GgufTensor& tensor) const;
     const float* f32_data(const GgufTensor& tensor) const;
     void matvec(const GgufTensor& tensor, const float* input,

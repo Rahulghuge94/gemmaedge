@@ -42,7 +42,7 @@ public:
     }
 
 private:
-    ExpertCache::Bytes load_expert(const ExpertKey& key) const;
+    ExpertView load_expert(const ExpertKey& key) const;
     const std::uint8_t* tensor_data(const GgufTensor& tensor) const;
     const float* f32_data(const GgufTensor& tensor) const;
     void matvec(const GgufTensor& tensor, const float* input,

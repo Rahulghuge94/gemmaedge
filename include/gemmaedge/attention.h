@@ -1,6 +1,7 @@
 #pragma once
 
 #include "gemmaedge/kv_store.h"
+#include "gemmaedge/tensor.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -54,8 +55,8 @@ private:
 
     AttentionConfig config_;
     std::vector<std::uint64_t> positions_;
-    std::vector<float> keys_;
-    std::vector<float> values_;
+    std::vector<BlockQ8_0> keys_;
+    std::vector<BlockQ8_0> values_;
 };
 
 } // namespace gemmaedge

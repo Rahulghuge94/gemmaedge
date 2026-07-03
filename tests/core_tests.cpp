@@ -25,10 +25,19 @@ void require(bool condition, const char* message) {
 void test_expert_cache() {
     using namespace gemmaedge;
     int loads = 0;
-    ExpertCache cache(24, [&](const ExpertKey& key) {
-        ++loads;
-        return ExpertCache::Bytes(8, static_cast<std::uint8_t>(key.expert));
-    });
+    int evictions_called = 0;
+    static const std::uint8_t mock_data[256]{};
+    ExpertCache cache(24,
+        [&](const ExpertKey& key) {
+            (void)key;
+            ++loads;
+            return ExpertView{mock_data, 8, 0};
+        },
+        [&](const ExpertKey& key, const ExpertView& view) {
+            (void)key;
+            (void)view;
+            ++evictions_called;
+        });
 
     const ExpertKey a{0, 1, TensorRole::ExpertGate};
     const ExpertKey b{0, 2, TensorRole::ExpertGate};
@@ -44,6 +53,7 @@ void test_expert_cache() {
     require(cache.contains(a), "hot expert was evicted");
     require(cache.stats().hits == 1, "cache hit count incorrect");
     require(cache.stats().evictions == 1, "cache eviction count incorrect");
+    require(evictions_called == 1, "evictor callback count incorrect");
     require(cache.stats().bytes_resident <= cache.budget(),
             "cache exceeded byte budget");
 }
@@ -178,42 +188,53 @@ void test_rope_attention_kv() {
             std::abs(rope[1] - std::sin(1.0f)) < 1e-6f,
             "RoPE rotation incorrect");
 
-    LayerKvCache cache({2, 1, 2, 2, 1.0f});
-    const float key0[] = {1.0f, 0.0f};
-    const float val0[] = {2.0f, 0.0f};
-    const float key1[] = {0.0f, 1.0f};
-    const float val1[] = {0.0f, 4.0f};
-    cache.append(0, key0, val0);
-    cache.append(1, key1, val1);
-    const float queries[] = {10.0f, 0.0f, 0.0f, 10.0f};
-    float output[4]{};
-    cache.attend(queries, output);
+    LayerKvCache cache({2, 1, 32, 2, 1.0f});
+    std::vector<float> key0(32, 0.0f);
+    std::vector<float> val0(32, 0.0f);
+    std::vector<float> key1(32, 0.0f);
+    std::vector<float> val1(32, 0.0f);
+    key0[0] = 1.0f;
+    val0[0] = 2.0f;
+    key1[1] = 1.0f;
+    val1[1] = 4.0f;
+    cache.append(0, key0.data(), val0.data());
+    cache.append(1, key1.data(), val1.data());
+
+    std::vector<float> queries(64, 0.0f);
+    queries[0] = 10.0f;
+    queries[32 + 1] = 10.0f;
+    std::vector<float> output(64, 0.0f);
+    cache.attend(queries.data(), output.data());
     require(output[0] > 1.99f && output[1] < 0.01f,
             "GQA head zero attended to wrong value");
-    require(output[2] < 0.01f && output[3] > 3.99f,
+    require(output[32] < 0.01f && output[32 + 1] > 3.99f,
             "GQA head one attended to wrong value");
 
-    const float key2[] = {1.0f, 1.0f};
-    const float val2[] = {6.0f, 6.0f};
-    cache.append(2, key2, val2);
+    std::vector<float> key2(32, 0.0f);
+    std::vector<float> val2(32, 0.0f);
+    key2[0] = 1.0f;
+    key2[1] = 1.0f;
+    val2[0] = 6.0f;
+    val2[1] = 6.0f;
+    cache.append(2, key2.data(), val2.data());
     require(cache.token_count() == 2 && cache.first_position() == 1,
             "sliding KV window did not evict oldest row");
-    float expected_after_eviction[4]{};
-    cache.attend(queries, expected_after_eviction);
+    std::vector<float> expected_after_eviction(64, 0.0f);
+    cache.attend(queries.data(), expected_after_eviction.data());
 
     const auto payload = cache.serialize_f32();
-    LayerKvCache restored({2, 1, 2, 2, 1.0f});
+    LayerKvCache restored({2, 1, 32, 2, 1.0f});
     restored.restore_f32(payload.data(), payload.size(), 1, 2);
-    float restored_output[4]{};
-    restored.attend(queries, restored_output);
-    for (std::size_t i = 0; i < 4; ++i)
+    std::vector<float> restored_output(64, 0.0f);
+    restored.attend(queries.data(), restored_output.data());
+    for (std::size_t i = 0; i < 64; ++i)
         require(std::abs(restored_output[i] - expected_after_eviction[i]) < 1e-6f,
                 "KV restore changed attention output");
 
     bool q8_rejected_unaligned = false;
     try {
-        (void)cache.to_disk_block(7);
-    } catch (const std::runtime_error&) {
+        LayerKvCache unaligned({2, 1, 2, 2, 1.0f});
+    } catch (const std::invalid_argument&) {
         q8_rejected_unaligned = true;
     }
     require(q8_rejected_unaligned,
@@ -361,8 +382,8 @@ void create_mock_gguf_file(const std::filesystem::path& path) {
     write_meta_f32("gemma4.final_logit_softcapping", 30.0f);
     write_meta_f32("gemma4.rope.freq_base_swa", 10000.0f);
     write_meta_f32("gemma4.rope.freq_base", 1000000.0f);
-    write_meta_u32("gemma4.attention.key_length_swa", 16);
-    write_meta_u32("gemma4.attention.key_length", 16);
+    write_meta_u32("gemma4.attention.key_length_swa", 32);
+    write_meta_u32("gemma4.attention.key_length", 32);
 
     write_string(out, "gemma4.attention.sliding_window_pattern");
     write_scalar<std::uint32_t>(out, 9); // Array
@@ -413,11 +434,11 @@ void create_mock_gguf_file(const std::filesystem::path& path) {
     for (int i = 0; i < 30; ++i) {
         const std::string prefix = "blk." + std::to_string(i) + ".";
         write_tensor(prefix + "attn_norm.weight", {2816});
-        write_tensor(prefix + "attn_q.weight", {2816, 128});
-        write_tensor(prefix + "attn_k.weight", {2816, 128});
-        write_tensor(prefix + "attn_output.weight", {128, 2816});
-        write_tensor(prefix + "attn_q_norm.weight", {128});
-        write_tensor(prefix + "attn_k_norm.weight", {128});
+        write_tensor(prefix + "attn_q.weight", {2816, 256});
+        write_tensor(prefix + "attn_k.weight", {2816, 256});
+        write_tensor(prefix + "attn_output.weight", {256, 2816});
+        write_tensor(prefix + "attn_q_norm.weight", {256});
+        write_tensor(prefix + "attn_k_norm.weight", {256});
         write_tensor(prefix + "post_attention_norm.weight", {2816});
         write_tensor(prefix + "ffn_gate.weight", {2816, 8});
         write_tensor(prefix + "ffn_up.weight", {2816, 8});

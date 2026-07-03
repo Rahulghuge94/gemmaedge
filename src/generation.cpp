@@ -111,6 +111,57 @@ Gemma4Session::Gemma4Session(
             head_dim, sliding ? config.sliding_window : 0, scale}));
     }
     scratch_.resize(config);
+
+    // Proactively advise OS on spine vs expert regions to reduce startup page fault latency.
+    weights_.advise_will_need(model_.token_embedding().absolute_offset,
+                              model_.token_embedding().bytes);
+    weights_.advise_will_need(model_.output_norm().absolute_offset,
+                              model_.output_norm().bytes);
+    weights_.advise_will_need(model_.output().absolute_offset,
+                              model_.output().bytes);
+    if (model_.rope_frequencies()) {
+        weights_.advise_will_need(model_.rope_frequencies()->absolute_offset,
+                                  model_.rope_frequencies()->bytes);
+    }
+
+    for (const auto& layer : model_.layers()) {
+        auto advise_need = [&](const GgufTensor* tensor) {
+            if (tensor) {
+                weights_.advise_will_need(tensor->absolute_offset, tensor->bytes);
+            }
+        };
+        auto advise_dont_need = [&](const GgufTensor* tensor) {
+            if (tensor) {
+                weights_.advise_dont_need(tensor->absolute_offset, tensor->bytes);
+            }
+        };
+
+        // Resident spine
+        advise_need(layer.attention_norm);
+        advise_need(layer.q);
+        advise_need(layer.k);
+        advise_need(layer.v);
+        advise_need(layer.attention_output);
+        advise_need(layer.q_norm);
+        advise_need(layer.k_norm);
+        advise_need(layer.post_attention_norm);
+        advise_need(layer.dense_gate);
+        advise_need(layer.dense_up);
+        advise_need(layer.dense_down);
+        advise_need(layer.ffn_norm);
+        advise_need(layer.post_ffn_norm);
+        advise_need(layer.router);
+        advise_need(layer.router_scale);
+        advise_need(layer.expert_output_scale);
+        advise_need(layer.pre_expert_norm);
+        advise_need(layer.post_dense_norm);
+        advise_need(layer.post_expert_norm);
+        advise_need(layer.layer_scale);
+
+        // MoE Experts (explicitly excluded to avoid paging them in during file scans)
+        advise_dont_need(layer.expert_gate_up);
+        advise_dont_need(layer.expert_down);
+    }
 }
 
 const std::uint8_t*
@@ -132,7 +183,7 @@ void Gemma4Session::matvec(const GgufTensor& tensor, const float* input,
                 tensor.dimensions[0], input, output);
 }
 
-const std::vector<float>& Gemma4Session::evaluate(TokenId token) {
+const std::vector<float>& Gemma4Session::evaluate(TokenId token, bool skip_logits) {
     const auto& embedding = model_.token_embedding();
     const auto& config = model_.config();
     if (token < 0 || static_cast<std::uint32_t>(token) >= config.vocab_size)
@@ -145,18 +196,18 @@ const std::vector<float>& Gemma4Session::evaluate(TokenId token) {
     ggml_dequantize_row(embedding.type, row, config.hidden_size, hidden.data());
     const float scale = std::sqrt(static_cast<float>(config.hidden_size));
     for (float& value : hidden) value *= scale;
-    return forward(hidden.data());
+    return forward(hidden.data(), skip_logits);
 }
 
 const std::vector<float>&
-Gemma4Session::evaluate_embedding(const float* embedding) {
+Gemma4Session::evaluate_embedding(const float* embedding, bool skip_logits) {
     if (!embedding) throw std::invalid_argument("null language embedding");
     std::vector<float> hidden(
         embedding, embedding + model_.config().hidden_size);
-    return forward(hidden.data());
+    return forward(hidden.data(), skip_logits);
 }
 
-const std::vector<float>& Gemma4Session::forward(float* hidden) {
+const std::vector<float>& Gemma4Session::forward(float* hidden, bool skip_logits) {
     const auto& config = model_.config();
     auto& s = scratch_;
 
@@ -212,13 +263,15 @@ const std::vector<float>& Gemma4Session::forward(float* hidden) {
         feed_forward_.forward(layer_index, s.layer_output.data(), hidden, s);
     }
 
-    rms_norm(hidden, f32_data(model_.output_norm()), config.hidden_size,
-             config.rms_epsilon, s.normalized.data());
-    matvec(model_.output(), s.normalized.data(), logits_.data());
-    if (config.final_logit_softcap > 0.0f) {
-        for (float& logit : logits_)
-            logit = config.final_logit_softcap *
-                    std::tanh(logit / config.final_logit_softcap);
+    if (!skip_logits) {
+        rms_norm(hidden, f32_data(model_.output_norm()), config.hidden_size,
+                 config.rms_epsilon, s.normalized.data());
+        matvec(model_.output(), s.normalized.data(), logits_.data());
+        if (config.final_logit_softcap > 0.0f) {
+            for (float& logit : logits_)
+                logit = config.final_logit_softcap *
+                        std::tanh(logit / config.final_logit_softcap);
+        }
     }
     ++position_;
     return logits_;
@@ -227,8 +280,10 @@ const std::vector<float>& Gemma4Session::forward(float* hidden) {
 const std::vector<float>&
 Gemma4Session::prefill(const std::vector<TokenId>& prompt) {
     if (prompt.empty()) throw std::invalid_argument("prompt is empty");
-    for (const auto token : prompt) evaluate(token);
-    return logits_;
+    for (std::size_t i = 0; i < prompt.size() - 1; ++i) {
+        evaluate(prompt[i], /*skip_logits=*/true);
+    }
+    return evaluate(prompt.back(), /*skip_logits=*/false);
 }
 
 std::vector<TokenId> Gemma4Session::generate(

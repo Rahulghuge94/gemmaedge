@@ -58,6 +58,10 @@ Gemma4FeedForward::Gemma4FeedForward(
       expert_cache_(expert_cache_bytes,
                     [this](const ExpertKey& key) {
                         return load_expert(key);
+                    },
+                    [this](const ExpertKey& key, const ExpertView& view) {
+                        (void)key;
+                        weights_.advise_dont_need(view.offset, view.size);
                     }) {}
 
 const std::uint8_t*
@@ -82,7 +86,7 @@ void Gemma4FeedForward::matvec(const GgufTensor& tensor,
                 input, output);
 }
 
-ExpertCache::Bytes
+ExpertView
 Gemma4FeedForward::load_expert(const ExpertKey& key) const {
     if (key.layer >= model_.layers().size())
         throw std::out_of_range("expert layer outside model");
@@ -99,9 +103,10 @@ Gemma4FeedForward::load_expert(const ExpertKey& key) const {
         throw std::out_of_range("expert index outside tensor");
 
     const std::uint64_t slice_bytes = tensor->bytes / tensor->dimensions[2];
-    const auto* source = weights_.view(
-        tensor->absolute_offset + slice_bytes * key.expert, slice_bytes);
-    return ExpertCache::Bytes(source, source + slice_bytes);
+    const std::uint64_t absolute_offset = tensor->absolute_offset + slice_bytes * key.expert;
+    weights_.advise_will_need(absolute_offset, slice_bytes);
+    const auto* source = weights_.view(absolute_offset, slice_bytes);
+    return {source, slice_bytes, absolute_offset};
 }
 
 // Original forward() — allocates scratch vectors per call (backward compat).
@@ -154,13 +159,13 @@ void Gemma4FeedForward::forward(
         const auto down_bytes =
             expert_cache_.get(down_key, selected_expert.probability);
 
-        ggml_matvec(layer.expert_gate_up->type, gate_bytes->data(),
+        ggml_matvec(layer.expert_gate_up->type, gate_bytes.data,
                     expert_size * 2, hidden, expert_input.data(),
                     gate_up.data());
         for (std::size_t i = 0; i < expert_size; ++i)
             activated[i] = gelu_tanh(gate_up[i]) *
                            gate_up[expert_size + i];
-        ggml_matvec(layer.expert_down->type, down_bytes->data(), hidden,
+        ggml_matvec(layer.expert_down->type, down_bytes.data, hidden,
                     expert_size, activated.data(), expert_output.data());
         for (std::size_t i = 0; i < hidden; ++i)
             expert_sum[i] += selected_expert.weight * expert_output[i];
@@ -224,13 +229,13 @@ void Gemma4FeedForward::forward(
         const auto down_bytes =
             expert_cache_.get(down_key, selected_expert.probability);
 
-        ggml_matvec(layer.expert_gate_up->type, gate_bytes->data(),
+        ggml_matvec(layer.expert_gate_up->type, gate_bytes.data,
                     expert_size * 2, hidden, s.expert_input.data(),
                     s.gate_up.data());
         for (std::size_t i = 0; i < expert_size; ++i)
             s.activated[i] = gelu_tanh(s.gate_up[i]) *
                              s.gate_up[expert_size + i];
-        ggml_matvec(layer.expert_down->type, down_bytes->data(), hidden,
+        ggml_matvec(layer.expert_down->type, down_bytes.data, hidden,
                     expert_size, s.activated.data(), s.expert_output.data());
         for (std::size_t i = 0; i < hidden; ++i)
             s.expert_sum[i] += selected_expert.weight * s.expert_output[i];

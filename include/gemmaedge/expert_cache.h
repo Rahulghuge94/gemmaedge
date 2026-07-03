@@ -11,6 +11,12 @@
 
 namespace gemmaedge {
 
+struct ExpertView {
+    const std::uint8_t* data{nullptr};
+    std::size_t size{0};
+    std::uint64_t offset{0};
+};
+
 struct ExpertKey {
     std::uint32_t layer;
     std::uint32_t expert;
@@ -36,12 +42,12 @@ struct ExpertCacheStats {
 
 class ExpertCache {
 public:
-    using Bytes = std::vector<std::uint8_t>;
-    using Loader = std::function<Bytes(const ExpertKey&)>;
+    using Loader = std::function<ExpertView(const ExpertKey&)>;
+    using Evictor = std::function<void(const ExpertKey&, const ExpertView&)>;
 
-    ExpertCache(std::uint64_t byte_budget, Loader loader);
+    ExpertCache(std::uint64_t byte_budget, Loader loader, Evictor evictor = nullptr);
 
-    std::shared_ptr<const Bytes> get(const ExpertKey& key, float router_probability);
+    ExpertView get(const ExpertKey& key, float router_probability);
     bool contains(const ExpertKey& key) const;
     void clear();
 
@@ -50,7 +56,7 @@ public:
 
 private:
     struct Slot {
-        std::shared_ptr<Bytes> bytes;
+        ExpertView view;
         float score;
         std::list<ExpertKey>::iterator lru;
     };
@@ -60,6 +66,7 @@ private:
 
     std::uint64_t byte_budget_;
     Loader loader_;
+    Evictor evictor_;
     std::list<ExpertKey> lru_;
     std::unordered_map<ExpertKey, Slot, ExpertKeyHash> slots_;
     ExpertCacheStats stats_{};

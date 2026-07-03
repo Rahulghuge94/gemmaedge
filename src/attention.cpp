@@ -29,44 +29,6 @@ T payload_scalar(const std::uint8_t*& cursor, const std::uint8_t* end) {
     return value;
 }
 
-void append_q8(std::vector<std::uint8_t>& output,
-               const std::vector<float>& values) {
-    if (values.size() % 32 != 0)
-        throw std::runtime_error("KV width is not Q8 block aligned");
-    for (std::size_t at = 0; at < values.size(); at += 32) {
-        float maximum = 0.0f;
-        for (std::size_t i = 0; i < 32; ++i)
-            maximum = std::max(maximum, std::abs(values[at + i]));
-        const float scale = maximum == 0.0f ? 0.0f : maximum / 127.0f;
-        append_scalar(output, f32_to_f16(scale));
-        for (std::size_t i = 0; i < 32; ++i) {
-            const int quantized = scale == 0.0f ? 0 :
-                static_cast<int>(std::nearbyint(values[at + i] / scale));
-            output.push_back(static_cast<std::uint8_t>(
-                static_cast<std::int8_t>(
-                    std::max(-127, std::min(127, quantized)))));
-        }
-    }
-}
-
-std::vector<float> read_q8(const std::uint8_t*& cursor,
-                           const std::uint8_t* end, std::size_t values) {
-    std::vector<float> result(values);
-    if (values % 32 != 0)
-        throw std::runtime_error("invalid Q8 KV value count");
-    for (std::size_t at = 0; at < values; at += 32) {
-        const float scale = f16_to_f32(
-            payload_scalar<std::uint16_t>(cursor, end));
-        if (static_cast<std::size_t>(end - cursor) < 32)
-            throw std::runtime_error("truncated Q8 KV block");
-        for (std::size_t i = 0; i < 32; ++i)
-            result[at + i] =
-                static_cast<std::int8_t>(cursor[i]) * scale;
-        cursor += 32;
-    }
-    return result;
-}
-
 } // namespace
 
 void apply_rope(float* states, std::size_t head_count, std::size_t head_dim,
@@ -100,6 +62,8 @@ LayerKvCache::LayerKvCache(AttentionConfig config) : config_(config) {
         config_.head_dim == 0 ||
         config_.query_heads % config_.kv_heads != 0)
         throw std::invalid_argument("invalid grouped-query attention shape");
+    if (config_.head_dim % 32 != 0)
+        throw std::invalid_argument("head_dim must be a multiple of 32");
 }
 
 std::size_t LayerKvCache::row_values() const noexcept {
@@ -113,17 +77,19 @@ void LayerKvCache::append(std::uint64_t position, const float* keys,
         throw std::invalid_argument("KV positions must increase");
 
     const auto width = row_values();
+    const std::size_t row_blocks = width / 32;
     positions_.push_back(position);
-    keys_.insert(keys_.end(), keys, keys + width);
-    values_.insert(values_.end(), values, values + width);
+
+    for (std::size_t b = 0; b < row_blocks; ++b) {
+        keys_.push_back(quantize_q8_block(keys + b * 32));
+        values_.push_back(quantize_q8_block(values + b * 32));
+    }
 
     if (config_.sliding_window &&
         positions_.size() > config_.sliding_window) {
         positions_.erase(positions_.begin());
-        keys_.erase(keys_.begin(), keys_.begin() +
-                    static_cast<std::ptrdiff_t>(width));
-        values_.erase(values_.begin(), values_.begin() +
-                      static_cast<std::ptrdiff_t>(width));
+        keys_.erase(keys_.begin(), keys_.begin() + row_blocks);
+        values_.erase(values_.begin(), values_.begin() + row_blocks);
     }
 }
 
@@ -135,7 +101,9 @@ void LayerKvCache::attend(const float* queries, float* output) const {
     if (positions_.empty()) return;
 
     const std::size_t width = row_values();
+    const std::size_t row_blocks = width / 32;
     const std::size_t group = config_.query_heads / config_.kv_heads;
+    const std::size_t blocks_per_head = config_.head_dim / 32;
     std::vector<float> scores(positions_.size());
 
     for (std::size_t qh = 0; qh < config_.query_heads; ++qh) {
@@ -143,11 +111,22 @@ void LayerKvCache::attend(const float* queries, float* output) const {
         const float* query = queries + qh * config_.head_dim;
         float maximum = -std::numeric_limits<float>::infinity();
         for (std::size_t token = 0; token < positions_.size(); ++token) {
-            const float* key = keys_.data() + token * width +
-                               kvh * config_.head_dim;
+            const BlockQ8_0* key_row = keys_.data() + token * row_blocks + kvh * blocks_per_head;
             double dot = 0.0;
-            for (std::size_t i = 0; i < config_.head_dim; ++i)
-                dot += static_cast<double>(query[i]) * key[i];
+            for (std::size_t b = 0; b < blocks_per_head; ++b) {
+                const auto& block = key_row[b];
+#if defined(__ARM_NEON)
+                dot += dot_q8_block_neon(block, query + b * 32);
+#else
+                const float scale = f16_to_f32(block.d);
+                const float* q_block = query + b * 32;
+                float sum = 0.0f;
+                for (std::size_t i = 0; i < 32; ++i) {
+                    sum += block.q[i] * q_block[i];
+                }
+                dot += sum * scale;
+#endif
+            }
             scores[token] = static_cast<float>(dot) * config_.scale;
             maximum = std::max(maximum, scores[token]);
         }
@@ -160,10 +139,20 @@ void LayerKvCache::attend(const float* queries, float* output) const {
         float* destination = output + qh * config_.head_dim;
         for (std::size_t token = 0; token < positions_.size(); ++token) {
             const float probability = scores[token] * inverse;
-            const float* value = values_.data() + token * width +
-                                 kvh * config_.head_dim;
-            for (std::size_t i = 0; i < config_.head_dim; ++i)
-                destination[i] += probability * value[i];
+            const BlockQ8_0* val_row = values_.data() + token * row_blocks + kvh * blocks_per_head;
+            for (std::size_t b = 0; b < blocks_per_head; ++b) {
+                const auto& block = val_row[b];
+                const float scale = f16_to_f32(block.d);
+                float* dest_block = destination + b * 32;
+                const float scale_prob = scale * probability;
+#if defined(__ARM_NEON)
+                accumulate_q8_block_neon(block, scale_prob, dest_block);
+#else
+                for (std::size_t i = 0; i < 32; ++i) {
+                    dest_block[i] += scale_prob * block.q[i];
+                }
+#endif
+            }
         }
     }
 }
@@ -175,12 +164,21 @@ void LayerKvCache::clear() {
 }
 
 std::vector<std::uint8_t> LayerKvCache::serialize_f32() const {
-    const std::size_t float_count = keys_.size() + values_.size();
+    const std::size_t tokens = positions_.size();
+    const std::size_t width = row_values();
+    const std::size_t float_count = tokens * width * 2;
     std::vector<std::uint8_t> result(float_count * sizeof(float));
-    const std::size_t key_bytes = keys_.size() * sizeof(float);
-    std::memcpy(result.data(), keys_.data(), key_bytes);
-    std::memcpy(result.data() + key_bytes, values_.data(),
-                values_.size() * sizeof(float));
+    float* output = reinterpret_cast<float*>(result.data());
+    
+    // Dequantize keys
+    for (std::size_t i = 0; i < keys_.size(); ++i) {
+        dequantize_q8_block(keys_[i], output + i * 32);
+    }
+    // Dequantize values
+    float* val_output = output + keys_.size() * 32;
+    for (std::size_t i = 0; i < values_.size(); ++i) {
+        dequantize_q8_block(values_[i], val_output + i * 32);
+    }
     return result;
 }
 
@@ -198,11 +196,21 @@ void LayerKvCache::restore_f32(const std::uint8_t* payload, std::size_t bytes,
     positions_.reserve(token_count);
     for (std::size_t i = 0; i < token_count; ++i)
         positions_.push_back(first_position + i);
-    keys_.resize(token_count * width);
-    values_.resize(token_count * width);
-    const auto half = token_count * width * sizeof(float);
-    std::memcpy(keys_.data(), payload, half);
-    std::memcpy(values_.data(), payload + half, half);
+
+    const std::size_t row_blocks = width / 32;
+    keys_.resize(token_count * row_blocks);
+    values_.resize(token_count * row_blocks);
+
+    const float* float_payload = reinterpret_cast<const float*>(payload);
+    // Quantize keys
+    for (std::size_t block_idx = 0; block_idx < token_count * row_blocks; ++block_idx) {
+        keys_[block_idx] = quantize_q8_block(float_payload + block_idx * 32);
+    }
+    // Quantize values
+    const float* val_payload = float_payload + token_count * width;
+    for (std::size_t block_idx = 0; block_idx < token_count * row_blocks; ++block_idx) {
+        values_[block_idx] = quantize_q8_block(val_payload + block_idx * 32);
+    }
 }
 
 KvBlock LayerKvCache::to_disk_block(std::uint32_t layer) const {
@@ -215,13 +223,18 @@ KvBlock LayerKvCache::to_disk_block(std::uint32_t layer) const {
         positions_.size() > std::numeric_limits<std::uint32_t>::max())
         throw std::runtime_error("disk KV block index overflow");
     std::vector<std::uint8_t> payload;
-    payload.reserve(16 + (keys_.size() + values_.size()) * 34 / 32);
+    payload.reserve(16 + (keys_.size() + values_.size()) * sizeof(BlockQ8_0));
     append_scalar(payload, kTieredKvMagic);
     append_scalar(payload, kTieredKvQ8);
     append_scalar(payload, static_cast<std::uint32_t>(positions_.size()));
     append_scalar(payload, static_cast<std::uint32_t>(row_values()));
-    append_q8(payload, keys_);
-    append_q8(payload, values_);
+
+    const auto* key_bytes = reinterpret_cast<const std::uint8_t*>(keys_.data());
+    payload.insert(payload.end(), key_bytes, key_bytes + keys_.size() * sizeof(BlockQ8_0));
+
+    const auto* val_bytes = reinterpret_cast<const std::uint8_t*>(values_.data());
+    payload.insert(payload.end(), val_bytes, val_bytes + values_.size() * sizeof(BlockQ8_0));
+
     return {{layer, static_cast<std::uint32_t>(positions_[0])},
             static_cast<std::uint32_t>(positions_.size()), std::move(payload)};
 }
@@ -236,9 +249,22 @@ void LayerKvCache::restore_disk_block(const KvBlock& block) {
     if (magic != kTieredKvMagic || precision != kTieredKvQ8 ||
         tokens != block.token_count || width != row_values())
         throw std::runtime_error("incompatible tiered KV payload");
-    keys_ = read_q8(cursor, end, static_cast<std::size_t>(tokens) * width);
-    values_ = read_q8(cursor, end, static_cast<std::size_t>(tokens) * width);
+
+    const std::size_t row_blocks = width / 32;
+    const std::size_t expected_bytes = tokens * row_blocks * sizeof(BlockQ8_0) * 2;
+    if (static_cast<std::size_t>(end - cursor) < expected_bytes)
+        throw std::runtime_error("truncated tiered KV payload data");
+
+    keys_.resize(tokens * row_blocks);
+    std::memcpy(keys_.data(), cursor, tokens * row_blocks * sizeof(BlockQ8_0));
+    cursor += tokens * row_blocks * sizeof(BlockQ8_0);
+
+    values_.resize(tokens * row_blocks);
+    std::memcpy(values_.data(), cursor, tokens * row_blocks * sizeof(BlockQ8_0));
+    cursor += tokens * row_blocks * sizeof(BlockQ8_0);
+
     if (cursor != end) throw std::runtime_error("trailing tiered KV bytes");
+
     positions_.clear();
     positions_.reserve(tokens);
     for (std::uint32_t i = 0; i < tokens; ++i)
