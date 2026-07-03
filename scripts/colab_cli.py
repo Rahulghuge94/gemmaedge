@@ -13,14 +13,16 @@ if os.path.exists(".env"):
         for line in f:
             line = line.strip()
             if line.startswith("COLAB_NOTEBOOK_URL="):
-                SERVER_URL = line.split("=")[1].strip()
+                SERVER_URL = line.split("=")[1].strip().strip('"').strip("'")
             elif line.startswith("AUTH_TOKEN="):
-                AUTH_TOKEN = line.split("=")[1].strip()
+                AUTH_TOKEN = line.split("=")[1].strip().strip('"').strip("'")
 
 if not SERVER_URL:
     print("Error: COLAB_NOTEBOOK_URL is not set in your .env file.")
     print("Please create a .env file containing: COLAB_NOTEBOOK_URL=https://your-tunnel-url.trycloudflare.com")
     sys.exit(1)
+
+import time
 
 def send_command(command: str, endpoint: str):
     try:
@@ -29,13 +31,51 @@ def send_command(command: str, endpoint: str):
             headers["X-Auth-Token"] = AUTH_TOKEN
         response = requests.post(endpoint, json={"command": command}, headers=headers)
         if response.status_code == 200:
-            return response.json()
+            res = response.json()
+            if "error" in res:
+                print(f"Error: {res['error']}")
+                return None
+            return res.get("task_id")
         else:
             print(f"\n[Client Error] Server status: {response.status_code}")
             return None
     except requests.exceptions.RequestException as e:
         print(f"\n[Client Error] Connection failed: {e}")
         return None
+
+def poll_task(task_id: str, server_url: str):
+    status_url = f"{server_url.rstrip('/')}/task/{task_id}"
+    headers = {}
+    if AUTH_TOKEN:
+        headers["X-Auth-Token"] = AUTH_TOKEN
+        
+    current_cwd = "/content"
+    while True:
+        try:
+            response = requests.get(status_url, headers=headers)
+            if response.status_code == 200:
+                data = response.json()
+                if "error" in data:
+                    print(f"Error: {data['error']}")
+                    return None
+                    
+                if data["stdout"]:
+                    print(data["stdout"], end="", flush=True)
+                if data["stderr"]:
+                    print(data["stderr"], file=sys.stderr, end="", flush=True)
+                    
+                if data["completed"]:
+                    return {
+                        "exit_code": data["exit_code"],
+                        "cwd": data.get("cwd", current_cwd)
+                    }
+            else:
+                print(f"\n[Client Error] Polling failed: {response.status_code}")
+                return None
+        except Exception as e:
+            print(f"\n[Client Error] Connection lost: {e}")
+            return None
+        time.sleep(0.5)
 
 def sync_repository():
     print("Syncing local repository with remote Colab...")
@@ -104,16 +144,13 @@ def start_interactive_shell():
                 sync_repository()
                 continue
 
-            # Send payload
-            data = send_command(command, endpoint)
+            # Send payload and get task_id
+            task_id = send_command(command, endpoint)
 
-            if data:
-                if data["stdout"]:
-                    print(data["stdout"], end="")
-                if data["stderr"]:
-                    print(data["stderr"], file=sys.stderr, end="")
-                # Update client prompt dynamically based on server directory
-                current_cwd = data.get("cwd", current_cwd)
+            if task_id:
+                result = poll_task(task_id, SERVER_URL)
+                if result:
+                    current_cwd = result.get("cwd", current_cwd)
 
         except (KeyboardInterrupt, EOFError):
             print("\nClosing session.")
@@ -129,11 +166,11 @@ if __name__ == "__main__":
         if full_command.lower() == "sync":
             sync_repository()
             sys.exit(0)
-        data = send_command(full_command, endpoint)
-        if data:
-            print(data["stdout"], end="")
-            print(data["stderr"], file=sys.stderr, end="")
-            sys.exit(data["exit_code"])
+        task_id = send_command(full_command, endpoint)
+        if task_id:
+            result = poll_task(task_id, SERVER_URL)
+            if result:
+                sys.exit(result["exit_code"])
         sys.exit(1)
 
     # If no args are passed, start the live active shell loop
