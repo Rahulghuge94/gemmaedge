@@ -21,6 +21,7 @@ add_library(gemmaedge_core
     src/feed_forward.cpp
     src/vision.cpp
     src/generation.cpp
+    src/vulkan_backend.cpp
 )
 target_include_directories(gemmaedge_core PUBLIC include)
 target_compile_definitions(gemmaedge_core PUBLIC

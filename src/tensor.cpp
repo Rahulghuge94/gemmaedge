@@ -1,4 +1,5 @@
 #include "gemmaedge/tensor.h"
+#include "gemmaedge/vulkan_backend.h"
 
 #include <algorithm>
 #include <cmath>
@@ -446,10 +447,17 @@ float dot_q6k(const BlockQ6K& block, const float* x) {
 
 } // namespace
 
+
 void ggml_matvec(GgmlType type, const void* matrix, std::size_t rows,
                  std::size_t cols, const float* vector, float* output) {
     if (!matrix || !vector || !output)
         throw std::invalid_argument("null GGML matvec input");
+
+    if (is_vulkan_available()) {
+        if (vulkan_matvec(matrix, rows, cols, vector, output)) {
+            return;
+        }
+    }
 
     parallel_for(0, rows, [&](std::size_t row) {
         float sum = 0.0f;
