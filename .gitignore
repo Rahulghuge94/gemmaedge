@@ -6,4 +6,7 @@
 *.gekv
 *.safetensors
 *.bin
+gemma_test.ipynb
+.env
+*.pycache
 
