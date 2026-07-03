@@ -1,0 +1,9 @@
+/build/
+/build-*/
+/.cxx/
+/.gradle/
+*.gge
+*.gekv
+*.safetensors
+*.bin
+
