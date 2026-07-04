@@ -1,6 +1,7 @@
 #include "gemmaedge/generation.h"
 
 #include "gemmaedge/tensor.h"
+#include "gemmaedge/cuda_backend.h"
 
 #include <algorithm>
 #include <cmath>
@@ -41,57 +42,82 @@ void ScratchArena::resize(const Gemma4Config& config) {
     activated.resize(expert_size);
     expert_output.resize(hidden);
     combined.resize(hidden);
+
+    // Token evaluation scratch
+    this->hidden.resize(hidden);
+
+    // Router scratch
+    router_norm.resize(hidden);
+    router_probs.resize(config.expert_count);
 }
 
 TokenId sample_token(const std::vector<float>& logits,
                      const SamplingConfig& config,
                      std::mt19937_64& random) {
     if (logits.empty()) throw std::invalid_argument("cannot sample empty logits");
+    const std::size_t vocab = logits.size();
+
+    // Greedy decoding: pure argmax, zero allocation
     if (config.temperature <= 0.0f) {
         return static_cast<TokenId>(
             std::max_element(logits.begin(), logits.end()) - logits.begin());
     }
 
-    std::vector<std::pair<TokenId, float>> candidates;
-    candidates.reserve(logits.size());
-    const float maximum = *std::max_element(logits.begin(), logits.end());
-    double denominator = 0.0;
-    for (std::size_t i = 0; i < logits.size(); ++i) {
-        const float probability =
-            std::exp((logits[i] - maximum) / config.temperature);
-        candidates.emplace_back(static_cast<TokenId>(i), probability);
-        denominator += probability;
+    // Build index array for partial sort (reused via thread_local)
+    thread_local std::vector<std::uint32_t> indices;
+    if (indices.size() != vocab) {
+        indices.resize(vocab);
+        for (std::uint32_t i = 0; i < vocab; ++i) indices[i] = i;
     }
-    for (auto& item : candidates)
-        item.second = static_cast<float>(item.second / denominator);
-    std::sort(candidates.begin(), candidates.end(),
-              [](const auto& a, const auto& b) {
-                  return a.second > b.second;
-              });
-    if (config.top_k && candidates.size() > config.top_k)
-        candidates.resize(config.top_k);
 
-    const float minimum = candidates.front().second * config.min_p;
+    // Determine how many candidates to partially sort
+    const std::size_t k = config.top_k ? std::min(static_cast<std::size_t>(config.top_k), vocab) : vocab;
+
+    // Partial sort: only the top-k elements are sorted, rest is O(N)
+    std::partial_sort(indices.begin(), indices.begin() + static_cast<std::ptrdiff_t>(k),
+                      indices.end(),
+                      [&logits](std::uint32_t a, std::uint32_t b) {
+                          return logits[a] > logits[b];
+                      });
+
+    // Compute softmax only over the top-k slice (tiny, e.g. 64 elements)
+    const float maximum = logits[indices[0]];
+    const float inv_temp = 1.0f / config.temperature;
+    thread_local std::vector<float> probs;
+    probs.resize(k);
+    double denominator = 0.0;
+    for (std::size_t i = 0; i < k; ++i) {
+        probs[i] = std::exp((logits[indices[i]] - maximum) * inv_temp);
+        denominator += probs[i];
+    }
+    const float inv_denom = static_cast<float>(1.0 / denominator);
+    for (std::size_t i = 0; i < k; ++i)
+        probs[i] *= inv_denom;
+
+    // Apply min_p and top_p filtering
+    const float minimum = probs[0] * config.min_p;
     float cumulative = 0.0f;
     std::size_t keep = 0;
-    for (; keep < candidates.size(); ++keep) {
-        if (candidates[keep].second < minimum && keep > 0) break;
-        cumulative += candidates[keep].second;
+    for (; keep < k; ++keep) {
+        if (probs[keep] < minimum && keep > 0) break;
+        cumulative += probs[keep];
         if (cumulative >= config.top_p && keep > 0) {
             ++keep;
             break;
         }
     }
-    candidates.resize(std::max<std::size_t>(1, keep));
+    keep = std::max<std::size_t>(1, keep);
+
+    // Sample from the kept candidates
     float mass = 0.0f;
-    for (const auto& item : candidates) mass += item.second;
+    for (std::size_t i = 0; i < keep; ++i) mass += probs[i];
     std::uniform_real_distribution<float> distribution(0.0f, mass);
     float choice = distribution(random);
-    for (const auto& item : candidates) {
-        choice -= item.second;
-        if (choice <= 0.0f) return item.first;
+    for (std::size_t i = 0; i < keep; ++i) {
+        choice -= probs[i];
+        if (choice <= 0.0f) return static_cast<TokenId>(indices[i]);
     }
-    return candidates.back().first;
+    return static_cast<TokenId>(indices[keep - 1]);
 }
 
 Gemma4Session::Gemma4Session(
@@ -162,6 +188,45 @@ Gemma4Session::Gemma4Session(
         advise_dont_need(layer.expert_gate_up);
         advise_dont_need(layer.expert_down);
     }
+
+    // Register resident spine tensors to VRAM
+    register_tensor(&model_.token_embedding());
+    register_tensor(&model_.output_norm());
+    register_tensor(&model_.output());
+    register_tensor(model_.rope_frequencies());
+
+    for (const auto& layer : model_.layers()) {
+        register_tensor(layer.attention_norm);
+        register_tensor(layer.q);
+        register_tensor(layer.k);
+        register_tensor(layer.v);
+        register_tensor(layer.attention_output);
+        register_tensor(layer.q_norm);
+        register_tensor(layer.k_norm);
+        register_tensor(layer.post_attention_norm);
+        register_tensor(layer.dense_gate);
+        register_tensor(layer.dense_up);
+        register_tensor(layer.dense_down);
+        register_tensor(layer.ffn_norm);
+        register_tensor(layer.post_ffn_norm);
+        register_tensor(layer.router);
+        register_tensor(layer.router_scale);
+        register_tensor(layer.expert_output_scale);
+        register_tensor(layer.pre_expert_norm);
+        register_tensor(layer.post_dense_norm);
+        register_tensor(layer.post_expert_norm);
+        register_tensor(layer.layer_scale);
+    }
+}
+
+Gemma4Session::~Gemma4Session() {
+    cuda_clear_weights();
+}
+
+void Gemma4Session::register_tensor(const GgufTensor* tensor) {
+    if (tensor) {
+        cuda_register_weight(tensor_data(*tensor), tensor->bytes);
+    }
 }
 
 const std::uint8_t*
@@ -183,6 +248,25 @@ void Gemma4Session::matvec(const GgufTensor& tensor, const float* input,
                 tensor.dimensions[0], input, output);
 }
 
+void Gemma4Session::upload_input(const float* input, std::size_t count) const {
+    cuda_upload_vector(input, count);
+}
+
+void Gemma4Session::matvec_device_vec(const GgufTensor& tensor,
+                                       const float* input, float* output) const {
+    if (tensor.dimensions.size() != 2)
+        throw std::runtime_error("generation matrix is not 2D: " + tensor.name);
+    // Try GPU path with already-uploaded input vector
+    if (is_cuda_available() &&
+        cuda_matvec_device_vec(tensor.type, tensor_data(tensor),
+                               tensor.dimensions[1], tensor.dimensions[0],
+                               output)) {
+        return;
+    }
+    // Fallback: can't use device vec — caller must use regular matvec
+    matvec(tensor, input, output);
+}
+
 const std::vector<float>& Gemma4Session::evaluate(TokenId token, bool skip_logits) {
     const auto& embedding = model_.token_embedding();
     const auto& config = model_.config();
@@ -192,19 +276,19 @@ const std::vector<float>& Gemma4Session::evaluate(TokenId token, bool skip_logit
     const auto* row = weights_.view(
         embedding.absolute_offset + row_bytes * static_cast<std::uint32_t>(token),
         row_bytes);
-    std::vector<float> hidden(config.hidden_size);
-    ggml_dequantize_row(embedding.type, row, config.hidden_size, hidden.data());
+    ggml_dequantize_row(embedding.type, row, config.hidden_size, scratch_.hidden.data());
     const float scale = std::sqrt(static_cast<float>(config.hidden_size));
-    for (float& value : hidden) value *= scale;
-    return forward(hidden.data(), skip_logits);
+    for (std::size_t i = 0; i < config.hidden_size; ++i)
+        scratch_.hidden[i] *= scale;
+    return forward(scratch_.hidden.data(), skip_logits);
 }
 
 const std::vector<float>&
 Gemma4Session::evaluate_embedding(const float* embedding, bool skip_logits) {
     if (!embedding) throw std::invalid_argument("null language embedding");
-    std::vector<float> hidden(
-        embedding, embedding + model_.config().hidden_size);
-    return forward(hidden.data(), skip_logits);
+    const auto& config = model_.config();
+    std::copy(embedding, embedding + config.hidden_size, scratch_.hidden.data());
+    return forward(scratch_.hidden.data(), skip_logits);
 }
 
 const std::vector<float>& Gemma4Session::forward(float* hidden, bool skip_logits) {
@@ -226,10 +310,20 @@ const std::vector<float>& Gemma4Session::forward(float* hidden, bool skip_logits
 
         rms_norm(hidden, f32_data(*layer.attention_norm), config.hidden_size,
                  config.rms_epsilon, s.normalized.data());
-        matvec(*layer.q, s.normalized.data(), s.q.data());
-        matvec(*layer.k, s.normalized.data(), s.k.data());
-        if (layer.v) matvec(*layer.v, s.normalized.data(), s.v.data());
-        else std::copy(s.k.data(), s.k.data() + kv_values, s.v.data());
+
+        // Upload normalized input once; Q, K, V projections share it
+        if (is_cuda_available()) {
+            upload_input(s.normalized.data(), config.hidden_size);
+            matvec_device_vec(*layer.q, s.normalized.data(), s.q.data());
+            matvec_device_vec(*layer.k, s.normalized.data(), s.k.data());
+            if (layer.v) matvec_device_vec(*layer.v, s.normalized.data(), s.v.data());
+            else std::copy(s.k.data(), s.k.data() + kv_values, s.v.data());
+        } else {
+            matvec(*layer.q, s.normalized.data(), s.q.data());
+            matvec(*layer.k, s.normalized.data(), s.k.data());
+            if (layer.v) matvec(*layer.v, s.normalized.data(), s.v.data());
+            else std::copy(s.k.data(), s.k.data() + kv_values, s.v.data());
+        }
 
         for (std::uint32_t head = 0; head < config.attention_heads; ++head)
             rms_norm(s.q.data() + static_cast<std::size_t>(head) * head_dim,
@@ -254,7 +348,12 @@ const std::vector<float>& Gemma4Session::forward(float* hidden, bool skip_logits
                    position_, rope_base, factors);
         kv_[layer_index]->append(position_, s.k.data(), s.v.data());
         kv_[layer_index]->attend(s.q.data(), s.attended.data());
-        matvec(*layer.attention_output, s.attended.data(), s.projected.data());
+        if (is_cuda_available()) {
+            upload_input(s.attended.data(), config.attention_heads * head_dim);
+            matvec_device_vec(*layer.attention_output, s.attended.data(), s.projected.data());
+        } else {
+            matvec(*layer.attention_output, s.attended.data(), s.projected.data());
+        }
         rms_norm(s.projected.data(), f32_data(*layer.post_attention_norm),
                  config.hidden_size, config.rms_epsilon, s.projected.data());
         for (std::size_t i = 0; i < config.hidden_size; ++i)
@@ -266,7 +365,12 @@ const std::vector<float>& Gemma4Session::forward(float* hidden, bool skip_logits
     if (!skip_logits) {
         rms_norm(hidden, f32_data(model_.output_norm()), config.hidden_size,
                  config.rms_epsilon, s.normalized.data());
-        matvec(model_.output(), s.normalized.data(), logits_.data());
+        if (is_cuda_available()) {
+            upload_input(s.normalized.data(), config.hidden_size);
+            matvec_device_vec(model_.output(), s.normalized.data(), logits_.data());
+        } else {
+            matvec(model_.output(), s.normalized.data(), logits_.data());
+        }
         if (config.final_logit_softcap > 0.0f) {
             for (float& logit : logits_)
                 logit = config.final_logit_softcap *

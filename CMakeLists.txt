@@ -39,6 +39,7 @@ add_library(gemmaedge_core ${GEMMAEDGE_SOURCES})
 if(CMAKE_CUDA_COMPILER)
     set_target_properties(gemmaedge_core PROPERTIES CUDA_STANDARD 17)
     target_compile_definitions(gemmaedge_core PRIVATE GEMMAEDGE_USE_CUDA=1)
+    target_compile_options(gemmaedge_core PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3 -arch=sm_75 --use_fast_math -DNDEBUG>)
 endif()
 target_include_directories(gemmaedge_core PUBLIC include)
 target_compile_definitions(gemmaedge_core PUBLIC
@@ -47,7 +48,9 @@ target_compile_definitions(gemmaedge_core PUBLIC
     $<$<PLATFORM_ID:Windows>:GEMMAEDGE_WINDOWS=1>
 )
 if(MSVC)
-    target_compile_options(gemmaedge_core PRIVATE /W4 /permissive-)
+    target_compile_options(gemmaedge_core PRIVATE /W4 /permissive- /arch:AVX2)
+elseif(NOT ANDROID AND NOT CMAKE_SYSTEM_PROCESSOR MATCHES "arm|aarch64")
+    target_compile_options(gemmaedge_core PRIVATE -Wall -Wextra -Wpedantic -mavx2 -mfma)
 else()
     target_compile_options(gemmaedge_core PRIVATE -Wall -Wextra -Wpedantic)
 endif()

@@ -21,6 +21,16 @@ route_top_k(const float* hidden, std::size_t hidden_size,
             std::size_t expert_count, std::size_t experts_used,
             const float* per_expert_scale, float epsilon);
 
+// Scratch-buffer overload: avoids per-call heap allocations (critical for edge).
+// `scratch_norm` must be at least `hidden_size` floats.
+// `scratch_probs` must be at least `expert_count` floats.
+std::vector<RoutedExpert>
+route_top_k(const float* hidden, std::size_t hidden_size,
+            const float* router_scale, const float* router_matrix,
+            std::size_t expert_count, std::size_t experts_used,
+            const float* per_expert_scale, float epsilon,
+            float* scratch_norm, float* scratch_probs);
+
 class Gemma4FeedForward {
 public:
     Gemma4FeedForward(const Gemma4Model& model, const MappedFile& weights,
@@ -47,6 +57,8 @@ private:
     const float* f32_data(const GgufTensor& tensor) const;
     void matvec(const GgufTensor& tensor, const float* input,
                 float* output) const;
+    void upload_input(const float* input, std::size_t count) const;
+    void matvec_device_vec(const GgufTensor& tensor, const float* input, float* output) const;
 
     const Gemma4Model& model_;
     const MappedFile& weights_;

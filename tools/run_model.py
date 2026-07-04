@@ -10,6 +10,6 @@ cmd = [
     "./build/gemmaedge", "generate",
     model_path,
     prompt,
-    "128"
+    "1024"
 ]
 subprocess.run(cmd)

@@ -2,6 +2,7 @@
 
 #include "gemmaedge/generation.h"
 #include "gemmaedge/tensor.h"
+#include "gemmaedge/cuda_backend.h"
 
 #include <algorithm>
 #include <cmath>
@@ -57,10 +58,17 @@ Gemma4FeedForward::Gemma4FeedForward(
     : model_(model), weights_(weights),
       expert_cache_(expert_cache_bytes,
                     [this](const ExpertKey& key) {
-                        return load_expert(key);
+                        ExpertView view = load_expert(key);
+                        if (is_cuda_available()) {
+                            cuda_register_weight(view.data, view.size);
+                        }
+                        return view;
                     },
                     [this](const ExpertKey& key, const ExpertView& view) {
                         (void)key;
+                        if (is_cuda_available()) {
+                            cuda_unregister_weight(view.data);
+                        }
                         weights_.advise_dont_need(view.offset, view.size);
                     }) {}
 
@@ -84,6 +92,24 @@ void Gemma4FeedForward::matvec(const GgufTensor& tensor,
                 static_cast<std::size_t>(tensor.dimensions[1]),
                 static_cast<std::size_t>(tensor.dimensions[0]),
                 input, output);
+}
+
+void Gemma4FeedForward::upload_input(const float* input, std::size_t count) const {
+    cuda_upload_vector(input, count);
+}
+
+void Gemma4FeedForward::matvec_device_vec(const GgufTensor& tensor, const float* input, float* output) const {
+    if (tensor.dimensions.size() != 2)
+        throw std::runtime_error("matvec tensor is not 2D: " + tensor.name);
+    if (is_cuda_available() &&
+        cuda_matvec_device_vec(tensor.type, tensor_data(tensor),
+                               static_cast<std::size_t>(tensor.dimensions[1]),
+                               static_cast<std::size_t>(tensor.dimensions[0]),
+                               output)) {
+        return;
+    }
+    // Fallback to CPU/standard GPU path
+    matvec(tensor, input, output);
 }
 
 ExpertView
@@ -200,11 +226,23 @@ void Gemma4FeedForward::forward(
 
     rms_norm(input, f32_data(*layer.ffn_norm), hidden, config.rms_epsilon,
              s.dense_input.data());
-    matvec(*layer.dense_gate, s.dense_input.data(), s.dense_gate.data());
-    matvec(*layer.dense_up, s.dense_input.data(), s.dense_up.data());
+             
+    if (is_cuda_available()) {
+        upload_input(s.dense_input.data(), hidden);
+        matvec_device_vec(*layer.dense_gate, s.dense_input.data(), s.dense_gate.data());
+        matvec_device_vec(*layer.dense_up, s.dense_input.data(), s.dense_up.data());
+    } else {
+        matvec(*layer.dense_gate, s.dense_input.data(), s.dense_gate.data());
+        matvec(*layer.dense_up, s.dense_input.data(), s.dense_up.data());
+    }
     for (std::size_t i = 0; i < dense_size; ++i)
         s.dense_gate[i] = gelu_tanh(s.dense_gate[i]) * s.dense_up[i];
-    matvec(*layer.dense_down, s.dense_gate.data(), s.dense_output.data());
+    if (is_cuda_available()) {
+        upload_input(s.dense_gate.data(), dense_size);
+        matvec_device_vec(*layer.dense_down, s.dense_gate.data(), s.dense_output.data());
+    } else {
+        matvec(*layer.dense_down, s.dense_gate.data(), s.dense_output.data());
+    }
     rms_norm(s.dense_output.data(), f32_data(*layer.post_dense_norm), hidden,
              config.rms_epsilon, s.dense_output.data());
 
@@ -216,29 +254,65 @@ void Gemma4FeedForward::forward(
 
     rms_norm(input, f32_data(*layer.pre_expert_norm), hidden,
              config.rms_epsilon, s.expert_input.data());
+             
     std::fill(s.expert_sum.begin(),
               s.expert_sum.begin() + static_cast<std::ptrdiff_t>(hidden), 0.0f);
 
-    for (const auto& selected_expert : selected) {
-        const ExpertKey gate_key{layer_index, selected_expert.expert,
-                                 TensorRole::ExpertGateUp};
-        const ExpertKey down_key{layer_index, selected_expert.expert,
-                                 TensorRole::ExpertDown};
-        const auto gate_bytes =
-            expert_cache_.get(gate_key, selected_expert.probability);
-        const auto down_bytes =
-            expert_cache_.get(down_key, selected_expert.probability);
+    if (is_cuda_available()) {
+        cuda_ensure_moe_buffers(hidden, expert_size);
+        cuda_zero_buffer(cuda_get_moe_sum_buf(), hidden);
+        upload_input(s.expert_input.data(), hidden);
 
-        ggml_matvec(layer.expert_gate_up->type, gate_bytes.data,
-                    expert_size * 2, hidden, s.expert_input.data(),
-                    s.gate_up.data());
-        for (std::size_t i = 0; i < expert_size; ++i)
-            s.activated[i] = gelu_tanh(s.gate_up[i]) *
-                             s.gate_up[expert_size + i];
-        ggml_matvec(layer.expert_down->type, down_bytes.data, hidden,
-                    expert_size, s.activated.data(), s.expert_output.data());
-        for (std::size_t i = 0; i < hidden; ++i)
-            s.expert_sum[i] += selected_expert.weight * s.expert_output[i];
+        for (const auto& selected_expert : selected) {
+            const ExpertKey gate_key{layer_index, selected_expert.expert,
+                                     TensorRole::ExpertGateUp};
+            const ExpertKey down_key{layer_index, selected_expert.expert,
+                                     TensorRole::ExpertDown};
+            const auto gate_bytes =
+                expert_cache_.get(gate_key, selected_expert.probability);
+            const auto down_bytes =
+                expert_cache_.get(down_key, selected_expert.probability);
+
+            cuda_matvec_d2d(layer.expert_gate_up->type, gate_bytes.data,
+                            cuda_get_vector_buf(), cuda_get_moe_gate_up_buf(),
+                            expert_size * 2, hidden);
+
+            cuda_moe_gelu(cuda_get_moe_gate_up_buf(), cuda_get_moe_activated_buf(), expert_size);
+
+            cuda_matvec_d2d(layer.expert_down->type, down_bytes.data,
+                            cuda_get_moe_activated_buf(), cuda_get_moe_output_buf(),
+                            hidden, expert_size);
+
+            cuda_moe_accumulate(cuda_get_moe_output_buf(), cuda_get_moe_sum_buf(),
+                                selected_expert.weight, hidden);
+        }
+
+        cuda_download_vector_from(s.expert_sum.data(), cuda_get_moe_sum_buf(), hidden);
+    } else {
+        for (const auto& selected_expert : selected) {
+            const ExpertKey gate_key{layer_index, selected_expert.expert,
+                                     TensorRole::ExpertGateUp};
+            const ExpertKey down_key{layer_index, selected_expert.expert,
+                                     TensorRole::ExpertDown};
+            const auto gate_bytes =
+                expert_cache_.get(gate_key, selected_expert.probability);
+            const auto down_bytes =
+                expert_cache_.get(down_key, selected_expert.probability);
+
+            ggml_matvec(layer.expert_gate_up->type, gate_bytes.data,
+                        expert_size * 2, hidden, s.expert_input.data(),
+                        s.gate_up.data());
+
+            for (std::size_t i = 0; i < expert_size; ++i)
+                s.activated[i] = gelu_tanh(s.gate_up[i]) *
+                                 s.gate_up[expert_size + i];
+
+            ggml_matvec(layer.expert_down->type, down_bytes.data, hidden,
+                        expert_size, s.activated.data(), s.expert_output.data());
+
+            for (std::size_t i = 0; i < hidden; ++i)
+                s.expert_sum[i] += selected_expert.weight * s.expert_output[i];
+        }
     }
     rms_norm(s.expert_sum.data(), f32_data(*layer.post_expert_norm), hidden,
              config.rms_epsilon, s.expert_sum.data());

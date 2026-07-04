@@ -33,12 +33,23 @@ public:
     void attend(const float* queries, float* output) const;
     void clear();
 
-    std::size_t token_count() const noexcept { return positions_.size(); }
+    std::size_t token_count() const noexcept { return count_; }
     std::uint64_t first_position() const noexcept {
-        return positions_.empty() ? 0 : positions_.front();
+        if (count_ == 0) return 0;
+        if (config_.sliding_window) {
+            // Ring buffer: oldest entry is at cursor_ (if full)
+            std::size_t oldest = (count_ == capacity_) ? cursor_ : 0;
+            return positions_[oldest];
+        }
+        return positions_[0];
     }
     std::uint64_t last_position() const noexcept {
-        return positions_.empty() ? 0 : positions_.back();
+        if (count_ == 0) return 0;
+        if (config_.sliding_window) {
+            std::size_t newest = (cursor_ == 0 ? capacity_ : cursor_) - 1;
+            return positions_[newest];
+        }
+        return positions_[count_ - 1];
     }
     const AttentionConfig& config() const noexcept { return config_; }
 
@@ -53,7 +64,16 @@ public:
 private:
     std::size_t row_values() const noexcept;
 
+    // Returns the linear index for the i-th token in age order (0=oldest)
+    std::size_t ring_index(std::size_t i) const noexcept {
+        if (!config_.sliding_window) return i;
+        return (cursor_ + capacity_ - count_ + i) % capacity_;
+    }
+
     AttentionConfig config_;
+    std::size_t capacity_{0};    // Pre-allocated slots (= sliding_window, or grows)
+    std::size_t cursor_{0};      // Next write position (ring buffer index)
+    std::size_t count_{0};       // Number of tokens currently stored
     std::vector<std::uint64_t> positions_;
     std::vector<BlockQ8_0> keys_;
     std::vector<BlockQ8_0> values_;

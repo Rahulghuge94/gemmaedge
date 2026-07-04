@@ -38,6 +38,13 @@ struct ScratchArena {
     std::vector<float> expert_output;
     std::vector<float> combined;
 
+    // Token evaluation scratch (avoids per-call alloc in evaluate())
+    std::vector<float> hidden;
+
+    // Router scratch (avoids per-call alloc in route_top_k())
+    std::vector<float> router_norm;
+    std::vector<float> router_probs;
+
     void resize(const Gemma4Config& config);
 };
 
@@ -50,7 +57,7 @@ struct SamplingConfig {
 };
 
 struct GenerationConfig {
-    std::uint32_t max_new_tokens{128};
+    std::uint32_t max_new_tokens{1024};
     SamplingConfig sampling{};
     std::vector<TokenId> stop_tokens{1, 106}; // <eos>, <turn|>
 };
@@ -63,6 +70,7 @@ class Gemma4Session {
 public:
     Gemma4Session(const Gemma4Model& model, const MappedFile& weights,
                   std::uint64_t expert_cache_bytes);
+    ~Gemma4Session();
 
     // Evaluates one language token and returns logits for the following token.
     const std::vector<float>& evaluate(TokenId token, bool skip_logits = false);
@@ -78,16 +86,23 @@ public:
 
     void reset();
     std::uint64_t position() const noexcept { return position_; }
+    const std::vector<float>& logits() const noexcept { return logits_; }
     const ExpertCacheStats& expert_cache_stats() const noexcept {
         return feed_forward_.cache_stats();
     }
 
 private:
+    void register_tensor(const GgufTensor* tensor);
     const std::vector<float>& forward(float* hidden, bool skip_logits = false);
     const std::uint8_t* tensor_data(const GgufTensor& tensor) const;
     const float* f32_data(const GgufTensor& tensor) const;
     void matvec(const GgufTensor& tensor, const float* input,
                 float* output) const;
+    // Upload input vector to GPU once for consecutive matvecs sharing the same input.
+    void upload_input(const float* input, std::size_t count) const;
+    // Matvec using already-uploaded device-resident input vector (avoids PCIe transfer).
+    // Falls back to standard matvec using the provided host input pointer if GPU fails.
+    void matvec_device_vec(const GgufTensor& tensor, const float* input, float* output) const;
 
     const Gemma4Model& model_;
     const MappedFile& weights_;

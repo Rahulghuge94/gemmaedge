@@ -5,7 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
-#include <limits>
+#include <climits>
 #include <stdexcept>
 #include <mutex>
 #include <condition_variable>
@@ -13,6 +13,11 @@
 #include <future>
 #include <thread>
 #include <functional>
+
+#if defined(__AVX2__) || (defined(_MSC_VER) && defined(__AVX2__))
+#include <immintrin.h>
+#define GEMMAEDGE_AVX2 1
+#endif
 
 namespace gemmaedge {
 
@@ -78,8 +83,13 @@ private:
 static ThreadPool& get_thread_pool() {
     static unsigned int num_threads = std::thread::hardware_concurrency();
     if (num_threads == 0) num_threads = 4;
+#if defined(GEMMAEDGE_ANDROID)
     // Cap at 4 threads for mobile/Android big cores to optimize thermal/power efficiency
     static ThreadPool pool(std::min(4u, num_threads));
+#else
+    // Desktop: use all available cores for maximum throughput
+    static ThreadPool pool(num_threads);
+#endif
     return pool;
 }
 
@@ -114,7 +124,9 @@ static void parallel_for(std::size_t start, std::size_t end, F&& loop_body) {
 
     std::size_t num_workers = std::thread::hardware_concurrency();
     if (num_workers == 0) num_workers = 4;
+#if defined(GEMMAEDGE_ANDROID)
     num_workers = std::min(4u, static_cast<unsigned int>(num_workers));
+#endif
 
     // Dynamic thermal awareness: scale down concurrency under high load/heat.
     const int temp_c = get_cpu_temperature_celsius();
@@ -432,6 +444,52 @@ inline float dot_q4k_neon(const BlockQ4K& block, const float* x) {
 float dot_q4k(const BlockQ4K& block, const float* x) {
 #if defined(__ARM_NEON)
     return dot_q4k_neon(block, x);
+#elif defined(GEMMAEDGE_AVX2)
+    const float d = f16_to_f32(block.d);
+    const float dmin = f16_to_f32(block.dmin);
+    __m256 sum_vec = _mm256_setzero_ps();
+    int group = 0;
+    const std::uint8_t* q = block.q;
+    for (int base = 0; base < 256; base += 64) {
+        std::uint8_t scale1, min1, scale2, min2;
+        q4k_scale_min(group++, block.scales, scale1, min1);
+        q4k_scale_min(group++, block.scales, scale2, min2);
+        __m256 f1 = _mm256_set1_ps(d * scale1);
+        __m256 b1 = _mm256_set1_ps(-dmin * min1);
+        __m256 f2 = _mm256_set1_ps(d * scale2);
+        __m256 b2 = _mm256_set1_ps(-dmin * min2);
+        // Low nibbles (32 values)
+        for (int i = 0; i < 32; i += 8) {
+            __m256 xv = _mm256_loadu_ps(x + base + i);
+            // Extract low nibbles from q[i..i+7]
+            __m256 qv = _mm256_set_ps(
+                (float)(q[i+7] & 0x0f), (float)(q[i+6] & 0x0f),
+                (float)(q[i+5] & 0x0f), (float)(q[i+4] & 0x0f),
+                (float)(q[i+3] & 0x0f), (float)(q[i+2] & 0x0f),
+                (float)(q[i+1] & 0x0f), (float)(q[i+0] & 0x0f));
+            __m256 dq = _mm256_fmadd_ps(qv, f1, b1);
+            sum_vec = _mm256_fmadd_ps(dq, xv, sum_vec);
+        }
+        // High nibbles (32 values)
+        for (int i = 0; i < 32; i += 8) {
+            __m256 xv = _mm256_loadu_ps(x + base + 32 + i);
+            __m256 qv = _mm256_set_ps(
+                (float)(q[i+7] >> 4), (float)(q[i+6] >> 4),
+                (float)(q[i+5] >> 4), (float)(q[i+4] >> 4),
+                (float)(q[i+3] >> 4), (float)(q[i+2] >> 4),
+                (float)(q[i+1] >> 4), (float)(q[i+0] >> 4));
+            __m256 dq = _mm256_fmadd_ps(qv, f2, b2);
+            sum_vec = _mm256_fmadd_ps(dq, xv, sum_vec);
+        }
+        q += 32;
+    }
+    // Horizontal sum of 8 floats
+    __m128 lo = _mm256_castps256_ps128(sum_vec);
+    __m128 hi = _mm256_extractf128_ps(sum_vec, 1);
+    __m128 s4 = _mm_add_ps(lo, hi);
+    __m128 s2 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));
+    __m128 s1 = _mm_add_ss(s2, _mm_shuffle_ps(s2, s2, 1));
+    return _mm_cvtss_f32(s1);
 #else
     const float d = f16_to_f32(block.d);
     const float dmin = f16_to_f32(block.dmin);
@@ -722,6 +780,43 @@ void rms_norm(const float* input, const float* weight, std::size_t size,
     for (; i < size; ++i) {
         output[i] = input[i] * inverse * (weight ? weight[i] : 1.0f);
     }
+#elif defined(GEMMAEDGE_AVX2)
+    // AVX2 vectorized rms_norm
+    __m256 sq_vec = _mm256_setzero_ps();
+    std::size_t i = 0;
+    for (; i + 7 < size; i += 8) {
+        __m256 in = _mm256_loadu_ps(input + i);
+        sq_vec = _mm256_fmadd_ps(in, in, sq_vec);
+    }
+    // Horizontal sum of sq_vec
+    __m128 lo = _mm256_castps256_ps128(sq_vec);
+    __m128 hi = _mm256_extractf128_ps(sq_vec, 1);
+    __m128 s4 = _mm_add_ps(lo, hi);
+    __m128 s2 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));
+    __m128 s1 = _mm_add_ss(s2, _mm_shuffle_ps(s2, s2, 1));
+    float squares = _mm_cvtss_f32(s1);
+    for (; i < size; ++i)
+        squares += input[i] * input[i];
+    const float inverse = 1.0f / std::sqrt(squares / static_cast<float>(size) + epsilon);
+    __m256 inv_vec = _mm256_set1_ps(inverse);
+
+    i = 0;
+    if (weight) {
+        for (; i + 7 < size; i += 8) {
+            __m256 in = _mm256_loadu_ps(input + i);
+            __m256 w = _mm256_loadu_ps(weight + i);
+            __m256 res = _mm256_mul_ps(_mm256_mul_ps(in, inv_vec), w);
+            _mm256_storeu_ps(output + i, res);
+        }
+    } else {
+        for (; i + 7 < size; i += 8) {
+            __m256 in = _mm256_loadu_ps(input + i);
+            __m256 res = _mm256_mul_ps(in, inv_vec);
+            _mm256_storeu_ps(output + i, res);
+        }
+    }
+    for (; i < size; ++i)
+        output[i] = input[i] * inverse * (weight ? weight[i] : 1.0f);
 #else
     double squares = 0.0;
     for (std::size_t i = 0; i < size; ++i)
