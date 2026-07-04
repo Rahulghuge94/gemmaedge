@@ -70,7 +70,23 @@ Gemma4FeedForward::Gemma4FeedForward(
                             cuda_unregister_weight(view.data);
                         }
                         weights_.advise_dont_need(view.offset, view.size);
-                    }) {}
+                    }) {
+    if (is_cuda_available() && expert_cache_bytes >= 600 * 1024 * 1024ULL) {
+        preload_all_experts();
+    }
+}
+
+void Gemma4FeedForward::preload_all_experts() {
+    const auto& config = model_.config();
+    for (std::uint32_t layer = 0; layer < model_.layers().size(); ++layer) {
+        for (std::uint32_t expert = 0; expert < config.expert_count; ++expert) {
+            ExpertKey gate_key{layer, expert, TensorRole::ExpertGateUp};
+            ExpertKey down_key{layer, expert, TensorRole::ExpertDown};
+            expert_cache_.get(gate_key, 0.0f);
+            expert_cache_.get(down_key, 0.0f);
+        }
+    }
+}
 
 const std::uint8_t*
 Gemma4FeedForward::tensor_data(const GgufTensor& tensor) const {
@@ -224,44 +240,41 @@ void Gemma4FeedForward::forward(
     const std::size_t dense_size = config.dense_intermediate;
     const std::size_t expert_size = config.expert_intermediate;
 
-    rms_norm(input, f32_data(*layer.ffn_norm), hidden, config.rms_epsilon,
-             s.dense_input.data());
-             
     if (is_cuda_available()) {
-        upload_input(s.dense_input.data(), hidden);
-        matvec_device_vec(*layer.dense_gate, s.dense_input.data(), s.dense_gate.data());
-        matvec_device_vec(*layer.dense_up, s.dense_input.data(), s.dense_up.data());
-    } else {
-        matvec(*layer.dense_gate, s.dense_input.data(), s.dense_gate.data());
-        matvec(*layer.dense_up, s.dense_input.data(), s.dense_up.data());
-    }
-    for (std::size_t i = 0; i < dense_size; ++i)
-        s.dense_gate[i] = gelu_tanh(s.dense_gate[i]) * s.dense_up[i];
-    if (is_cuda_available()) {
-        upload_input(s.dense_gate.data(), dense_size);
-        matvec_device_vec(*layer.dense_down, s.dense_gate.data(), s.dense_output.data());
-    } else {
-        matvec(*layer.dense_down, s.dense_gate.data(), s.dense_output.data());
-    }
-    rms_norm(s.dense_output.data(), f32_data(*layer.post_dense_norm), hidden,
-             config.rms_epsilon, s.dense_output.data());
+        const auto selected = route_top_k(
+            input, hidden, f32_data(*layer.router_scale),
+            f32_data(*layer.router), config.expert_count, config.experts_used,
+            f32_data(*layer.expert_output_scale), config.rms_epsilon);
+        if (routing) *routing = selected;
 
-    const auto selected = route_top_k(
-        input, hidden, f32_data(*layer.router_scale),
-        f32_data(*layer.router), config.expert_count, config.experts_used,
-        f32_data(*layer.expert_output_scale), config.rms_epsilon);
-    if (routing) *routing = selected;
+        // Prefetch all selected expert weights in parallel from OS page cache
+        for (const auto& selected_expert : selected) {
+            const ExpertKey gate_key{layer_index, selected_expert.expert, TensorRole::ExpertGateUp};
+            const ExpertKey down_key{layer_index, selected_expert.expert, TensorRole::ExpertDown};
+            if (!expert_cache_.contains(gate_key)) {
+                const auto& l = model_.layers()[layer_index];
+                const GgufTensor* tensor = l.expert_gate_up;
+                const std::uint64_t slice_bytes = tensor->bytes / tensor->dimensions[2];
+                const std::uint64_t absolute_offset = tensor->absolute_offset + slice_bytes * selected_expert.expert;
+                weights_.advise_will_need(absolute_offset, slice_bytes);
+            }
+            if (!expert_cache_.contains(down_key)) {
+                const auto& l = model_.layers()[layer_index];
+                const GgufTensor* tensor = l.expert_down;
+                const std::uint64_t slice_bytes = tensor->bytes / tensor->dimensions[2];
+                const std::uint64_t absolute_offset = tensor->absolute_offset + slice_bytes * selected_expert.expert;
+                weights_.advise_will_need(absolute_offset, slice_bytes);
+            }
+        }
 
-    rms_norm(input, f32_data(*layer.pre_expert_norm), hidden,
-             config.rms_epsilon, s.expert_input.data());
-             
-    std::fill(s.expert_sum.begin(),
-              s.expert_sum.begin() + static_cast<std::ptrdiff_t>(hidden), 0.0f);
-
-    if (is_cuda_available()) {
-        cuda_ensure_moe_buffers(hidden, expert_size);
-        cuda_zero_buffer(cuda_get_moe_sum_buf(), hidden);
-        upload_input(s.expert_input.data(), hidden);
+        const std::size_t num_experts = selected.size();
+        std::vector<CudaMatvecStep> expert_gate_steps;
+        std::vector<CudaMatvecStep> expert_down_steps;
+        expert_gate_steps.reserve(num_experts);
+        expert_down_steps.reserve(num_experts);
+        
+        std::vector<float> host_expert_weights;
+        host_expert_weights.reserve(num_experts);
 
         for (const auto& selected_expert : selected) {
             const ExpertKey gate_key{layer_index, selected_expert.expert,
@@ -273,22 +286,51 @@ void Gemma4FeedForward::forward(
             const auto down_bytes =
                 expert_cache_.get(down_key, selected_expert.probability);
 
-            cuda_matvec_d2d(layer.expert_gate_up->type, gate_bytes.data,
-                            cuda_get_vector_buf(), cuda_get_moe_gate_up_buf(),
-                            expert_size * 2, hidden);
-
-            cuda_moe_gelu(cuda_get_moe_gate_up_buf(), cuda_get_moe_activated_buf(), expert_size);
-
-            cuda_matvec_d2d(layer.expert_down->type, down_bytes.data,
-                            cuda_get_moe_activated_buf(), cuda_get_moe_output_buf(),
-                            hidden, expert_size);
-
-            cuda_moe_accumulate(cuda_get_moe_output_buf(), cuda_get_moe_sum_buf(),
-                                selected_expert.weight, hidden);
+            expert_gate_steps.push_back({layer.expert_gate_up->type, gate_bytes.data, 0, expert_size * 2, hidden});
+            expert_down_steps.push_back({layer.expert_down->type, down_bytes.data, 0, hidden, expert_size});
+            host_expert_weights.push_back(selected_expert.weight);
         }
 
-        cuda_download_vector_from(s.expert_sum.data(), cuda_get_moe_sum_buf(), hidden);
+        cuda_ffn_execute(input,
+                         layer.dense_gate->type, tensor_data(*layer.dense_gate),
+                         layer.dense_up->type, tensor_data(*layer.dense_up),
+                         layer.dense_down->type, tensor_data(*layer.dense_down),
+                         f32_data(*layer.ffn_norm),
+                         f32_data(*layer.post_dense_norm),
+                         f32_data(*layer.pre_expert_norm),
+                         f32_data(*layer.post_expert_norm),
+                         expert_gate_steps,
+                         expert_down_steps,
+                         host_expert_weights.data(),
+                         s.combined.data(),
+                         hidden,
+                         dense_size,
+                         expert_size,
+                         num_experts,
+                         config.rms_epsilon);
     } else {
+        rms_norm(input, f32_data(*layer.ffn_norm), hidden, config.rms_epsilon,
+                 s.dense_input.data());
+        matvec(*layer.dense_gate, s.dense_input.data(), s.dense_gate.data());
+        matvec(*layer.dense_up, s.dense_input.data(), s.dense_up.data());
+        for (std::size_t i = 0; i < dense_size; ++i)
+            s.dense_gate[i] = gelu_tanh(s.dense_gate[i]) * s.dense_up[i];
+        matvec(*layer.dense_down, s.dense_gate.data(), s.dense_output.data());
+        rms_norm(s.dense_output.data(), f32_data(*layer.post_dense_norm), hidden,
+                 config.rms_epsilon, s.dense_output.data());
+
+        const auto selected = route_top_k(
+            input, hidden, f32_data(*layer.router_scale),
+            f32_data(*layer.router), config.expert_count, config.experts_used,
+            f32_data(*layer.expert_output_scale), config.rms_epsilon);
+        if (routing) *routing = selected;
+
+        rms_norm(input, f32_data(*layer.pre_expert_norm), hidden,
+                 config.rms_epsilon, s.expert_input.data());
+                 
+        std::fill(s.expert_sum.begin(),
+                  s.expert_sum.begin() + static_cast<std::ptrdiff_t>(hidden), 0.0f);
+
         for (const auto& selected_expert : selected) {
             const ExpertKey gate_key{layer_index, selected_expert.expert,
                                      TensorRole::ExpertGateUp};
@@ -313,12 +355,12 @@ void Gemma4FeedForward::forward(
             for (std::size_t i = 0; i < hidden; ++i)
                 s.expert_sum[i] += selected_expert.weight * s.expert_output[i];
         }
-    }
-    rms_norm(s.expert_sum.data(), f32_data(*layer.post_expert_norm), hidden,
-             config.rms_epsilon, s.expert_sum.data());
+        rms_norm(s.expert_sum.data(), f32_data(*layer.post_expert_norm), hidden,
+                 config.rms_epsilon, s.expert_sum.data());
 
-    for (std::size_t i = 0; i < hidden; ++i)
-        s.combined[i] = s.dense_output[i] + s.expert_sum[i];
+        for (std::size_t i = 0; i < hidden; ++i)
+            s.combined[i] = s.dense_output[i] + s.expert_sum[i];
+    }
     rms_norm(s.combined.data(), f32_data(*layer.post_ffn_norm), hidden,
              config.rms_epsilon, s.combined.data());
 

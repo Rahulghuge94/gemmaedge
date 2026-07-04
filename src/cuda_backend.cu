@@ -2,6 +2,7 @@
 
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
+#include <cuda_fp16.h>
 #include <mutex>
 #include <unordered_map>
 
@@ -13,30 +14,7 @@ namespace {
 // ============================================================================
 
 __device__ inline float cuda_f16_to_f32(uint16_t h) {
-    uint32_t sign = (h & 0x8000u) << 16;
-    uint32_t exponent = (h >> 10) & 0x1fu;
-    uint32_t mantissa = h & 0x3ffu;
-    uint32_t bits;
-    if (exponent == 0) {
-        if (mantissa == 0) {
-            bits = sign;
-        } else {
-            exponent = 1;
-            while ((mantissa & 0x400u) == 0) {
-                mantissa <<= 1;
-                --exponent;
-            }
-            mantissa &= 0x3ffu;
-            bits = sign | ((exponent + 112u) << 23) | (mantissa << 13);
-        }
-    } else if (exponent == 31) {
-        bits = sign | 0x7f800000u | (mantissa << 13);
-    } else {
-        bits = sign | ((exponent + 112u) << 23) | (mantissa << 13);
-    }
-    float result;
-    memcpy(&result, &bits, sizeof(result));
-    return result;
+    return __half2float(*reinterpret_cast<const __half*>(&h));
 }
 
 // Warp-level sum reduction (no shared memory needed)
@@ -97,6 +75,43 @@ __device__ inline ScaleMin cuda_q4k_scale_min(int index, const uint8_t* packed) 
     return res;
 }
 
+__device__ inline ScaleMin cuda_q4k_scale_min_reg(int index, uint32_t meta_y, uint32_t meta_z, uint32_t meta_w) {
+    ScaleMin res;
+    uint8_t packed_val;
+    uint8_t packed_val_next;
+    if (index < 4) {
+        packed_val = (meta_y >> (index * 8)) & 0xFFu;
+        packed_val_next = (meta_z >> (index * 8)) & 0xFFu;
+        res.scale = packed_val & 63;
+        res.minimum = packed_val_next & 63;
+    } else {
+        int idx_shifted = index - 4;
+        packed_val = (meta_w >> (idx_shifted * 8)) & 0xFFu;
+        packed_val_next = (meta_y >> (idx_shifted * 8)) & 0xFFu;
+        uint8_t packed_val_idx = (meta_z >> (idx_shifted * 8)) & 0xFFu;
+        res.scale = (packed_val & 0x0f) | ((packed_val_next >> 6) << 4);
+        res.minimum = (packed_val >> 4) | ((packed_val_idx >> 6) << 4);
+    }
+    return res;
+}
+
+__device__ inline int8_t extract_scale_q6(int idx, uint32_t s_x, uint32_t s_y, uint32_t s_z, uint32_t s_w) {
+    uint32_t reg;
+    if (idx < 4) {
+        reg = s_x;
+    } else if (idx < 8) {
+        reg = s_y;
+        idx -= 4;
+    } else if (idx < 12) {
+        reg = s_z;
+        idx -= 8;
+    } else {
+        reg = s_w;
+        idx -= 12;
+    }
+    return static_cast<int8_t>((reg >> (idx * 8)) & 0xFFu);
+}
+
 // ============================================================================
 // WARP-COOPERATIVE MATVEC KERNELS
 // Each warp (32 threads) cooperates on a single output row.
@@ -132,21 +147,24 @@ __global__ void matvec_q4_0_kernel(const BlockQ4_0* __restrict__ matrix,
 
     int blocks_per_row = cols / 32;
     const BlockQ4_0* row = matrix + (long long)warp_id * blocks_per_row;
-    float sum = 0.0f;
+    float local = 0.0f;
 
-    for (int b = lane; b < blocks_per_row; b += 32) {
+    for (int b = 0; b < blocks_per_row; ++b) {
         const BlockQ4_0& block = row[b];
-        float scale = cuda_f16_to_f32(block.d);
+        uint16_t d_val;
+        if (lane == 0) d_val = block.d;
+        float scale = cuda_f16_to_f32(__shfl_sync(0xFFFFFFFF, d_val, 0));
         int v_off = b * 32;
-        float local = 0.0f;
-        for (int i = 0; i < 16; ++i) {
-            uint8_t packed = block.qs[i];
-            local += scale * ((int)(packed & 0x0f) - 8) * vec[v_off + i];
-            local += scale * ((int)(packed >> 4) - 8) * vec[v_off + 16 + i];
+        
+        int val;
+        if (lane < 16) {
+            val = (block.qs[lane] & 0x0f) - 8;
+        } else {
+            val = (block.qs[lane - 16] >> 4) - 8;
         }
-        sum += local;
+        local += scale * val * vec[v_off + lane];
     }
-    sum = warp_reduce_sum(sum);
+    float sum = warp_reduce_sum(local);
     if (lane == 0) out[warp_id] = sum;
 }
 
@@ -161,18 +179,17 @@ __global__ void matvec_q8_0_kernel(const BlockQ8_0* __restrict__ matrix,
 
     int blocks_per_row = cols / 32;
     const BlockQ8_0* row = matrix + (long long)warp_id * blocks_per_row;
-    float sum = 0.0f;
+    float local = 0.0f;
 
-    for (int b = lane; b < blocks_per_row; b += 32) {
+    for (int b = 0; b < blocks_per_row; ++b) {
         const BlockQ8_0& block = row[b];
-        float scale = cuda_f16_to_f32(block.d);
+        uint16_t d_val;
+        if (lane == 0) d_val = block.d;
+        float scale = cuda_f16_to_f32(__shfl_sync(0xFFFFFFFF, d_val, 0));
         int v_off = b * 32;
-        float local = 0.0f;
-        for (int i = 0; i < 32; ++i)
-            local += (float)block.q[i] * vec[v_off + i];
-        sum += local * scale;
+        local += (float)block.q[lane] * vec[v_off + lane] * scale;
     }
-    sum = warp_reduce_sum(sum);
+    float sum = warp_reduce_sum(local);
     if (lane == 0) out[warp_id] = sum;
 }
 
@@ -187,35 +204,46 @@ __global__ void matvec_q4_k_kernel(const BlockQ4K* __restrict__ matrix,
 
     int blocks_per_row = cols / 256;
     const BlockQ4K* row = matrix + (long long)warp_id * blocks_per_row;
-    float sum = 0.0f;
+    float local = 0.0f;
 
-    for (int b = lane; b < blocks_per_row; b += 32) {
+    for (int b = 0; b < blocks_per_row; ++b) {
         const BlockQ4K& block = row[b];
-        float d = cuda_f16_to_f32(block.d);
-        float dmin = cuda_f16_to_f32(block.dmin);
-        int group = 0;
-        const uint8_t* q = block.q;
+        
+        // Coalesced metadata load (16 bytes in a single load)
+        uint4 meta;
+        if (lane == 0) {
+            meta = *reinterpret_cast<const uint4*>(&block);
+        }
+        
+        // Broadcast metadata registers to all threads in the warp
+        uint32_t meta_x = __shfl_sync(0xFFFFFFFF, meta.x, 0);
+        uint32_t meta_y = __shfl_sync(0xFFFFFFFF, meta.y, 0);
+        uint32_t meta_z = __shfl_sync(0xFFFFFFFF, meta.z, 0);
+        uint32_t meta_w = __shfl_sync(0xFFFFFFFF, meta.w, 0);
+
+        float d = cuda_f16_to_f32(meta_x & 0xFFFFu);
+        float dmin = cuda_f16_to_f32(meta_x >> 16);
+        
         int v_off = b * 256;
-        float local = 0.0f;
+        const uint8_t* q = block.q;
+        int group = 0;
 
         for (int base = 0; base < 256; base += 64) {
-            ScaleMin sm1 = cuda_q4k_scale_min(group++, block.scales);
-            ScaleMin sm2 = cuda_q4k_scale_min(group++, block.scales);
+            ScaleMin sm1 = cuda_q4k_scale_min_reg(group++, meta_y, meta_z, meta_w);
+            ScaleMin sm2 = cuda_q4k_scale_min_reg(group++, meta_y, meta_z, meta_w);
 
             float factor1 = d * sm1.scale;
             float bias1 = -dmin * sm1.minimum;
             float factor2 = d * sm2.scale;
             float bias2 = -dmin * sm2.minimum;
 
-            for (int i = 0; i < 32; ++i)
-                local += (factor1 * (q[i] & 0x0f) + bias1) * vec[v_off + base + i];
-            for (int i = 0; i < 32; ++i)
-                local += (factor2 * (q[i] >> 4) + bias2) * vec[v_off + base + 32 + i];
+            uint8_t q_val = q[lane];
+            local += (factor1 * (q_val & 0x0f) + bias1) * vec[v_off + base + lane];
+            local += (factor2 * (q_val >> 4) + bias2) * vec[v_off + base + 32 + lane];
             q += 32;
         }
-        sum += local;
     }
-    sum = warp_reduce_sum(sum);
+    float sum = warp_reduce_sum(local);
     if (lane == 0) out[warp_id] = sum;
 }
 
@@ -230,36 +258,62 @@ __global__ void matvec_q6_k_kernel(const BlockQ6K* __restrict__ matrix,
 
     int blocks_per_row = cols / 256;
     const BlockQ6K* row = matrix + (long long)warp_id * blocks_per_row;
-    float sum = 0.0f;
+    float local = 0.0f;
 
-    for (int b = lane; b < blocks_per_row; b += 32) {
+    for (int b = 0; b < blocks_per_row; ++b) {
         const BlockQ6K& block = row[b];
-        float d = cuda_f16_to_f32(block.d);
+        
+        // Coalesced scales load (16 bytes)
+        uint4 scales_val;
+        uint16_t d_val;
+        if (lane == 0) {
+            scales_val = *reinterpret_cast<const uint4*>(block.scales);
+            d_val = block.d;
+        }
+        
+        // Broadcast
+        uint32_t s_x = __shfl_sync(0xFFFFFFFF, scales_val.x, 0);
+        uint32_t s_y = __shfl_sync(0xFFFFFFFF, scales_val.y, 0);
+        uint32_t s_z = __shfl_sync(0xFFFFFFFF, scales_val.z, 0);
+        uint32_t s_w = __shfl_sync(0xFFFFFFFF, scales_val.w, 0);
+        uint16_t d_reg = __shfl_sync(0xFFFFFFFF, d_val, 0);
+        
+        float d = cuda_f16_to_f32(d_reg);
         const uint8_t* ql = block.ql;
         const uint8_t* qh = block.qh;
-        const int8_t* scales = block.scales;
         int v_off = b * 256;
-        float local = 0.0f;
 
+        int scale_group_offset = 0;
         for (int base = 0; base < 256; base += 128) {
-            for (int i = 0; i < 32; ++i) {
-                int g = i / 16;
-                int q1 = ((ql[i] & 0x0f) | (((qh[i] >> 0) & 3) << 4)) - 32;
-                int q2 = ((ql[i + 32] & 0x0f) | (((qh[i] >> 2) & 3) << 4)) - 32;
-                int q3 = ((ql[i] >> 4) | (((qh[i] >> 4) & 3) << 4)) - 32;
-                int q4 = ((ql[i + 32] >> 4) | (((qh[i] >> 6) & 3) << 4)) - 32;
-                local += d * scales[g + 0] * q1 * vec[v_off + base + i];
-                local += d * scales[g + 2] * q2 * vec[v_off + base + 32 + i];
-                local += d * scales[g + 4] * q3 * vec[v_off + base + 64 + i];
-                local += d * scales[g + 6] * q4 * vec[v_off + base + 96 + i];
-            }
+            int g = lane / 16;
+            
+            // Extract scales from registers directly
+            int scale_1_idx = scale_group_offset + g + 0;
+            int scale_2_idx = scale_group_offset + g + 2;
+            int scale_3_idx = scale_group_offset + g + 4;
+            int scale_4_idx = scale_group_offset + g + 6;
+            
+            int8_t s1 = extract_scale_q6(scale_1_idx, s_x, s_y, s_z, s_w);
+            int8_t s2 = extract_scale_q6(scale_2_idx, s_x, s_y, s_z, s_w);
+            int8_t s3 = extract_scale_q6(scale_3_idx, s_x, s_y, s_z, s_w);
+            int8_t s4 = extract_scale_q6(scale_4_idx, s_x, s_y, s_z, s_w);
+
+            int q1 = ((ql[lane] & 0x0f) | (((qh[lane] >> 0) & 3) << 4)) - 32;
+            int q2 = ((ql[lane + 32] & 0x0f) | (((qh[lane] >> 2) & 3) << 4)) - 32;
+            int q3 = ((ql[lane] >> 4) | (((qh[lane] >> 4) & 3) << 4)) - 32;
+            int q4 = ((ql[lane + 32] >> 4) | (((qh[lane] >> 6) & 3) << 4)) - 32;
+            
+            local += d * s1 * q1 * vec[v_off + base + lane];
+            local += d * s2 * q2 * vec[v_off + base + 32 + lane];
+            local += d * s3 * q3 * vec[v_off + base + 64 + lane];
+            local += d * s4 * q4 * vec[v_off + base + 96 + lane];
+            
             ql += 64;
             qh += 32;
-            scales += 8;
+            scale_group_offset += 8;
         }
-        sum += local;
     }
-    sum = warp_reduce_sum(sum);
+    float sum = warp_reduce_sum(local);
     if (lane == 0) out[warp_id] = sum;
 }
 
@@ -293,18 +347,46 @@ struct CudaWorkspace {
     float* d_moe_activated = nullptr;
     float* d_moe_output = nullptr;
     float* d_moe_sum = nullptr;
+    float* d_moe_weights = nullptr;
+    float* d_moe_input = nullptr;
     std::size_t moe_capacity = 0;
+
+    // Dense FFN device buffers
+    float* d_dense_gate_up = nullptr;
+    float* d_dense_activated = nullptr;
+    float* d_dense_output = nullptr;
+    std::size_t dense_capacity = 0;
 
     cudaStream_t stream = nullptr;
     cudaStream_t stream_b = nullptr;  // second stream for overlapped uploads
+    cudaStream_t streams[8] = {nullptr};
+    cudaEvent_t norm_event = nullptr;
+    cudaEvent_t dense_event = nullptr;
+    cudaEvent_t exp_norm_event = nullptr;
+    cudaEvent_t act_event = nullptr;
+    cudaEvent_t expert_events[8] = {nullptr};
     bool initialized = false;
 
-    void ensure(std::size_t mat_bytes, std::size_t vec_elems, std::size_t out_elems) {
+    void initialize_streams() {
         if (!initialized) {
             cudaStreamCreate(&stream);
             cudaStreamCreate(&stream_b);
+            for (int i = 0; i < 8; ++i) {
+                cudaStreamCreate(&streams[i]);
+            }
+            cudaEventCreateWithFlags(&norm_event, cudaEventDisableTiming);
+            cudaEventCreateWithFlags(&dense_event, cudaEventDisableTiming);
+            cudaEventCreateWithFlags(&exp_norm_event, cudaEventDisableTiming);
+            cudaEventCreateWithFlags(&act_event, cudaEventDisableTiming);
+            for (int i = 0; i < 8; ++i) {
+                cudaEventCreateWithFlags(&expert_events[i], cudaEventDisableTiming);
+            }
             initialized = true;
         }
+    }
+
+    void ensure(std::size_t mat_bytes, std::size_t vec_elems, std::size_t out_elems) {
+        initialize_streams();
         if (mat_bytes > 0 && mat_bytes > matrix_capacity) {
             if (d_matrix) cudaFree(d_matrix);
             d_matrix = nullptr;
@@ -342,30 +424,53 @@ struct CudaWorkspace {
         }
     }
 
-    void ensure_moe_buffers(std::size_t hidden, std::size_t expert_size) {
-        if (!initialized) {
-            cudaStreamCreate(&stream);
-            cudaStreamCreate(&stream_b);
-            initialized = true;
-        }
-        std::size_t req_capacity = hidden > expert_size * 2 ? hidden : expert_size * 2;
+    void ensure_moe_buffers(std::size_t hidden, std::size_t expert_size, std::size_t num_experts) {
+        initialize_streams();
+        std::size_t req_capacity = (hidden > expert_size * 2 ? hidden : expert_size * 2) * num_experts;
         if (req_capacity > moe_capacity) {
             if (d_moe_gate_up) cudaFree(d_moe_gate_up);
             if (d_moe_activated) cudaFree(d_moe_activated);
             if (d_moe_output) cudaFree(d_moe_output);
             if (d_moe_sum) cudaFree(d_moe_sum);
+            if (d_moe_weights) cudaFree(d_moe_weights);
+            if (d_moe_input) cudaFree(d_moe_input);
             
             d_moe_gate_up = nullptr;
             d_moe_activated = nullptr;
             d_moe_output = nullptr;
             d_moe_sum = nullptr;
+            d_moe_weights = nullptr;
+            d_moe_input = nullptr;
             moe_capacity = 0;
             
-            if (cudaMalloc(&d_moe_gate_up, expert_size * 2 * sizeof(float)) == cudaSuccess &&
-                cudaMalloc(&d_moe_activated, expert_size * sizeof(float)) == cudaSuccess &&
-                cudaMalloc(&d_moe_output, hidden * sizeof(float)) == cudaSuccess &&
-                cudaMalloc(&d_moe_sum, hidden * sizeof(float)) == cudaSuccess) {
+            if (cudaMalloc(&d_moe_gate_up, num_experts * expert_size * 2 * sizeof(float)) == cudaSuccess &&
+                cudaMalloc(&d_moe_activated, num_experts * expert_size * sizeof(float)) == cudaSuccess &&
+                cudaMalloc(&d_moe_output, num_experts * hidden * sizeof(float)) == cudaSuccess &&
+                cudaMalloc(&d_moe_sum, hidden * sizeof(float)) == cudaSuccess &&
+                cudaMalloc(&d_moe_weights, num_experts * sizeof(float)) == cudaSuccess &&
+                cudaMalloc(&d_moe_input, hidden * sizeof(float)) == cudaSuccess) {
                 moe_capacity = req_capacity;
+            }
+        }
+    }
+
+    void ensure_dense_buffers(std::size_t hidden, std::size_t dense_size) {
+        initialize_streams();
+        std::size_t req_capacity = (dense_size * 2 > hidden ? dense_size * 2 : hidden);
+        if (req_capacity > dense_capacity) {
+            if (d_dense_gate_up) cudaFree(d_dense_gate_up);
+            if (d_dense_activated) cudaFree(d_dense_activated);
+            if (d_dense_output) cudaFree(d_dense_output);
+            
+            d_dense_gate_up = nullptr;
+            d_dense_activated = nullptr;
+            d_dense_output = nullptr;
+            dense_capacity = 0;
+            
+            if (cudaMalloc(&d_dense_gate_up, dense_size * 2 * sizeof(float)) == cudaSuccess &&
+                cudaMalloc(&d_dense_activated, dense_size * sizeof(float)) == cudaSuccess &&
+                cudaMalloc(&d_dense_output, hidden * sizeof(float)) == cudaSuccess) {
+                dense_capacity = req_capacity;
             }
         }
     }
@@ -381,8 +486,23 @@ struct CudaWorkspace {
         if (d_moe_activated) cudaFree(d_moe_activated);
         if (d_moe_output) cudaFree(d_moe_output);
         if (d_moe_sum) cudaFree(d_moe_sum);
+        if (d_moe_weights) cudaFree(d_moe_weights);
+        if (d_moe_input) cudaFree(d_moe_input);
+        if (d_dense_gate_up) cudaFree(d_dense_gate_up);
+        if (d_dense_activated) cudaFree(d_dense_activated);
+        if (d_dense_output) cudaFree(d_dense_output);
         if (stream) cudaStreamDestroy(stream);
         if (stream_b) cudaStreamDestroy(stream_b);
+        for (int i = 0; i < 8; ++i) {
+            if (streams[i]) cudaStreamDestroy(streams[i]);
+        }
+        if (norm_event) cudaEventDestroy(norm_event);
+        if (dense_event) cudaEventDestroy(dense_event);
+        if (exp_norm_event) cudaEventDestroy(exp_norm_event);
+        if (act_event) cudaEventDestroy(act_event);
+        for (int i = 0; i < 8; ++i) {
+            if (expert_events[i]) cudaEventDestroy(expert_events[i]);
+        }
     }
 };
 
@@ -412,7 +532,7 @@ static std::size_t weight_bytes_for(GgmlType type, std::size_t rows, std::size_t
 static void launch_kernel(GgmlType type, const void* dev_matrix,
                           const float* dev_vec, float* dev_out,
                           int rows, int cols, cudaStream_t s) {
-    constexpr int kThreadsPerBlock = 256;
+    constexpr int kThreadsPerBlock = 64;
     constexpr int kWarpsPerBlock = kThreadsPerBlock / 32;
     int blocks = (rows + kWarpsPerBlock - 1) / kWarpsPerBlock;
 
@@ -660,6 +780,36 @@ __global__ void accumulate_sum_kernel(const float* expert_output, float* expert_
     expert_sum[idx] += weight * expert_output[idx];
 }
 
+__global__ void gelu_activation_batch_kernel(const float* gate_up, float* activated, int expert_size, int num_experts) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = expert_size * num_experts;
+    if (idx >= total_elements) return;
+    
+    int exp_idx = idx / expert_size;
+    int local_idx = idx % expert_size;
+    
+    const float* exp_gate_up = gate_up + exp_idx * expert_size * 2;
+    float* exp_activated = activated + exp_idx * expert_size;
+    
+    float g = exp_gate_up[local_idx];
+    float u = exp_gate_up[expert_size + local_idx];
+    float x = 0.79788456f * (g + 0.044715f * g * g * g);
+    float tanh_x = tanhf(x);
+    float gelu_g = 0.5f * g * (1.0f + tanh_x);
+    exp_activated[local_idx] = gelu_g * u;
+}
+
+__global__ void accumulate_sum_batch_kernel(const float* expert_outputs, float* expert_sum, const float* weights, int hidden, int num_experts) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= hidden) return;
+    
+    float sum = 0.0f;
+    for (int e = 0; e < num_experts; ++e) {
+        sum += weights[e] * expert_outputs[e * hidden + idx];
+    }
+    expert_sum[idx] += sum;
+}
+
 bool cuda_matvec_d2d(GgmlType type, const void* matrix, const float* d_vector,
                      float* d_output, std::size_t rows, std::size_t cols) {
     if (!is_cuda_available()) return false;
@@ -730,6 +880,10 @@ float* cuda_get_vector_buf() {
     return get_workspace().d_vector;
 }
 
+float* cuda_get_output_buf() {
+    return get_workspace().d_output;
+}
+
 float* cuda_get_moe_gate_up_buf() {
     return get_workspace().d_moe_gate_up;
 }
@@ -746,8 +900,391 @@ float* cuda_get_moe_sum_buf() {
     return get_workspace().d_moe_sum;
 }
 
-void cuda_ensure_moe_buffers(std::size_t hidden, std::size_t expert_size) {
-    get_workspace().ensure_moe_buffers(hidden, expert_size);
+void cuda_ensure_moe_buffers(std::size_t hidden, std::size_t expert_size, std::size_t num_experts) {
+    get_workspace().ensure_moe_buffers(hidden, expert_size, num_experts);
+}
+
+bool cuda_matvec_batch(const std::vector<CudaMatvecStep>& steps, const float* d_vector, std::size_t total_out_elems) {
+    if (!is_cuda_available() || steps.empty()) return false;
+
+    std::lock_guard<std::mutex> lock(g_cuda_mutex);
+    auto& ws = get_workspace();
+
+    ws.ensure(0, 0, total_out_elems);
+    if (!ws.d_output) return false;
+
+    if (steps.size() == 1) {
+        const auto& step = steps[0];
+        std::size_t wbytes = weight_bytes_for(step.type, step.rows, step.cols);
+        void* dev_matrix = nullptr;
+        auto it = g_cuda_weights.find(step.matrix);
+        if (it != g_cuda_weights.end()) {
+            dev_matrix = it->second;
+        } else {
+            ws.ensure(wbytes, 0, 0);
+            if (!ws.d_matrix) return false;
+            if (cudaMemcpyAsync(ws.d_matrix, step.matrix, wbytes,
+                                cudaMemcpyHostToDevice, ws.stream) != cudaSuccess)
+                return false;
+            dev_matrix = ws.d_matrix;
+        }
+        launch_kernel(step.type, dev_matrix, d_vector, ws.d_output + step.out_offset,
+                      static_cast<int>(step.rows), static_cast<int>(step.cols), ws.stream);
+    } else {
+        std::vector<cudaStream_t> streams = {ws.stream, ws.stream_b, ws.streams[0]};
+        for (std::size_t i = 0; i < steps.size(); ++i) {
+            const auto& step = steps[i];
+            cudaStream_t s = (i < streams.size()) ? streams[i] : ws.stream;
+            void* dev_matrix = nullptr;
+            auto it = g_cuda_weights.find(step.matrix);
+            if (it != g_cuda_weights.end()) {
+                dev_matrix = it->second;
+            }
+            if (dev_matrix) {
+                launch_kernel(step.type, dev_matrix, d_vector, ws.d_output + step.out_offset,
+                              static_cast<int>(step.rows), static_cast<int>(step.cols), s);
+            }
+        }
+        
+        // Sync helper streams back to ws.stream
+        cudaEventRecord(ws.dense_event, ws.stream_b);
+        cudaStreamWaitEvent(ws.stream, ws.dense_event, 0);
+        
+        cudaEventRecord(ws.act_event, ws.streams[0]);
+        cudaStreamWaitEvent(ws.stream, ws.act_event, 0);
+    }
+    return true;
+}
+
+void cuda_moe_batch(const std::vector<CudaMatvecStep>& gate_steps,
+                    const std::vector<CudaMatvecStep>& down_steps,
+                    const float* host_weights,
+                    float* host_expert_sum,
+                    std::size_t hidden,
+                    std::size_t expert_size,
+                    std::size_t num_experts) {
+    if (!is_cuda_available()) return;
+    std::lock_guard<std::mutex> lock(g_cuda_mutex);
+    auto& ws = get_workspace();
+
+    ws.ensure_moe_buffers(hidden, expert_size, num_experts);
+    if (!ws.d_moe_gate_up || !ws.d_moe_activated || !ws.d_moe_output || !ws.d_moe_sum || !ws.d_moe_weights) return;
+
+    cuda_zero_buffer(ws.d_moe_sum, hidden);
+    cudaMemcpyAsync(ws.d_moe_weights, host_weights, num_experts * sizeof(float), cudaMemcpyHostToDevice, ws.stream);
+
+    for (std::size_t i = 0; i < num_experts; ++i) {
+        auto step = gate_steps[i];
+        std::size_t wbytes = weight_bytes_for(step.type, step.rows, step.cols);
+        void* dev_matrix = nullptr;
+        auto it = g_cuda_weights.find(step.matrix);
+        if (it != g_cuda_weights.end()) {
+            dev_matrix = it->second;
+        } else {
+            ws.ensure(wbytes, 0, 0);
+            cudaMemcpyAsync(ws.d_matrix, step.matrix, wbytes, cudaMemcpyHostToDevice, ws.stream);
+            dev_matrix = ws.d_matrix;
+        }
+        float* d_out = ws.d_moe_gate_up + i * expert_size * 2;
+        launch_kernel(step.type, dev_matrix, ws.d_vector, d_out,
+                      static_cast<int>(step.rows), static_cast<int>(step.cols), ws.stream);
+    }
+
+    int threads = 256;
+    int total_elements = static_cast<int>(expert_size * num_experts);
+    int blocks = (total_elements + threads - 1) / threads;
+    gelu_activation_batch_kernel<<<blocks, threads, 0, ws.stream>>>(
+        ws.d_moe_gate_up, ws.d_moe_activated, static_cast<int>(expert_size), static_cast<int>(num_experts));
+
+    for (std::size_t i = 0; i < num_experts; ++i) {
+        auto step = down_steps[i];
+        std::size_t wbytes = weight_bytes_for(step.type, step.rows, step.cols);
+        void* dev_matrix = nullptr;
+        auto it = g_cuda_weights.find(step.matrix);
+        if (it != g_cuda_weights.end()) {
+            dev_matrix = it->second;
+        } else {
+            ws.ensure(wbytes, 0, 0);
+            cudaMemcpyAsync(ws.d_matrix, step.matrix, wbytes, cudaMemcpyHostToDevice, ws.stream);
+            dev_matrix = ws.d_matrix;
+        }
+        float* d_in = ws.d_moe_activated + i * expert_size;
+        float* d_out = ws.d_moe_output + i * hidden;
+        launch_kernel(step.type, dev_matrix, d_in, d_out,
+                      static_cast<int>(step.rows), static_cast<int>(step.cols), ws.stream);
+    }
+
+    blocks = (static_cast<int>(hidden) + threads - 1) / threads;
+    accumulate_sum_batch_kernel<<<blocks, threads, 0, ws.stream>>>(
+        ws.d_moe_output, ws.d_moe_sum, ws.d_moe_weights, static_cast<int>(hidden), static_cast<int>(num_experts));
+
+    std::size_t bytes = hidden * sizeof(float);
+    if (ws.h_pinned_output && ws.pinned_output_capacity >= bytes) {
+        cudaMemcpyAsync(ws.h_pinned_output, ws.d_moe_sum, bytes, cudaMemcpyDeviceToHost, ws.stream);
+        cudaStreamSynchronize(ws.stream);
+        memcpy(host_expert_sum, ws.h_pinned_output, bytes);
+    } else {
+        cudaMemcpyAsync(host_expert_sum, ws.d_moe_sum, bytes, cudaMemcpyDeviceToHost, ws.stream);
+        cudaStreamSynchronize(ws.stream);
+    }
+}
+
+__global__ void rms_norm_kernel(const float* input, const float* weight, float* output, float epsilon, int dim) {
+    int idx = threadIdx.x;
+    extern __shared__ float sdata[];
+    
+    float sum = 0.0f;
+    for (int i = idx; i < dim; i += blockDim.x) {
+        float val = input[i];
+        sum += val * val;
+    }
+    
+    sdata[idx] = sum;
+    __syncthreads();
+    
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (idx < s) {
+            sdata[idx] += sdata[idx + s];
+        }
+        __syncthreads();
+    }
+    
+    __shared__ float r_rms;
+    if (idx == 0) {
+        r_rms = rsqrtf(sdata[0] / dim + epsilon);
+    }
+    __syncthreads();
+    
+    for (int i = idx; i < dim; i += blockDim.x) {
+        output[i] = input[i] * r_rms * (weight ? weight[i] : 1.0f);
+    }
+}
+
+__global__ void add_vectors_kernel(const float* a, const float* b, float* out, int dim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < dim) {
+        out[idx] = a[idx] + b[idx];
+    }
+}
+
+void cuda_ffn_execute(const float* host_ffn_input,
+                      GgmlType dense_gate_type, const void* dense_gate_matrix,
+                      GgmlType dense_up_type, const void* dense_up_matrix,
+                      GgmlType dense_down_type, const void* dense_down_matrix,
+                      const float* ffn_norm_weight,
+                      const float* post_dense_norm_weight,
+                      const float* pre_expert_norm_weight,
+                      const float* post_expert_norm_weight,
+                      const std::vector<CudaMatvecStep>& expert_gate_steps,
+                      const std::vector<CudaMatvecStep>& expert_down_steps,
+                      const float* host_expert_weights,
+                      float* host_ffn_output,
+                      std::size_t hidden,
+                      std::size_t dense_size,
+                      std::size_t expert_size,
+                      std::size_t num_experts,
+                      float epsilon) {
+    if (!is_cuda_available()) return;
+    std::lock_guard<std::mutex> lock(g_cuda_mutex);
+    auto& ws = get_workspace();
+
+    ws.ensure_dense_buffers(hidden, dense_size);
+    ws.ensure_moe_buffers(hidden, expert_size, num_experts);
+
+    // 1. Upload host_ffn_input to ws.d_vector
+    cudaMemcpyAsync(ws.d_vector, host_ffn_input, hidden * sizeof(float), cudaMemcpyHostToDevice, ws.stream);
+
+    // 2. Run ffn_norm (RMS Norm) on ws.d_vector -> ws.d_moe_input
+    const float* d_ffn_norm_weight = nullptr;
+    if (ffn_norm_weight) {
+        auto it = g_cuda_weights.find(ffn_norm_weight);
+        if (it != g_cuda_weights.end()) d_ffn_norm_weight = static_cast<const float*>(it->second);
+    }
+    
+    rms_norm_kernel<<<1, 256, 256 * sizeof(float), ws.stream>>>(
+        ws.d_vector, d_ffn_norm_weight, ws.d_moe_input, epsilon, static_cast<int>(hidden));
+
+    // Sync stream to stream_b so Dense Up doesn't run before RMS Norm finishes
+    cudaEventRecord(ws.norm_event, ws.stream);
+    cudaStreamWaitEvent(ws.stream_b, ws.norm_event, 0);
+
+    // 3. Dense Gate & Up Matvec (Executed concurrently on stream and stream_b)
+    void* dev_matrix_gate = nullptr;
+    {
+        auto it = g_cuda_weights.find(dense_gate_matrix);
+        if (it != g_cuda_weights.end()) {
+            dev_matrix_gate = it->second;
+        } else {
+            std::size_t wbytes = weight_bytes_for(dense_gate_type, dense_size, hidden);
+            ws.ensure(wbytes, 0, 0);
+            cudaMemcpyAsync(ws.d_matrix, dense_gate_matrix, wbytes, cudaMemcpyHostToDevice, ws.stream);
+            dev_matrix_gate = ws.d_matrix;
+        }
+        launch_kernel(dense_gate_type, dev_matrix_gate, ws.d_moe_input, ws.d_dense_gate_up,
+                      static_cast<int>(dense_size), static_cast<int>(hidden), ws.stream);
+    }
+    void* dev_matrix_up = nullptr;
+    {
+        auto it = g_cuda_weights.find(dense_up_matrix);
+        if (it != g_cuda_weights.end()) {
+            dev_matrix_up = it->second;
+        } else {
+            std::size_t wbytes = weight_bytes_for(dense_up_type, dense_size, hidden);
+            ws.ensure(wbytes, 0, 0);
+            cudaMemcpyAsync(ws.d_matrix_b, dense_up_matrix, wbytes, cudaMemcpyHostToDevice, ws.stream_b);
+            dev_matrix_up = ws.d_matrix_b;
+        }
+        launch_kernel(dense_up_type, dev_matrix_up, ws.d_moe_input, ws.d_dense_gate_up + dense_size,
+                      static_cast<int>(dense_size), static_cast<int>(hidden), ws.stream_b);
+    }
+
+    // Sync stream_b to stream before activation
+    cudaEventRecord(ws.dense_event, ws.stream_b);
+    cudaStreamWaitEvent(ws.stream, ws.dense_event, 0);
+
+    // 4. Dense GELU Activation
+    int threads = 256;
+    int blocks = (static_cast<int>(dense_size) + threads - 1) / threads;
+    gelu_activation_kernel<<<blocks, threads, 0, ws.stream>>>(
+        ws.d_dense_gate_up, ws.d_dense_activated, static_cast<int>(dense_size));
+
+    // 5. Dense Down Step
+    {
+        void* dev_matrix = nullptr;
+        auto it = g_cuda_weights.find(dense_down_matrix);
+        if (it != g_cuda_weights.end()) {
+            dev_matrix = it->second;
+        } else {
+            std::size_t wbytes = weight_bytes_for(dense_down_type, hidden, dense_size);
+            ws.ensure(wbytes, 0, 0);
+            cudaMemcpyAsync(ws.d_matrix, dense_down_matrix, wbytes, cudaMemcpyHostToDevice, ws.stream);
+            dev_matrix = ws.d_matrix;
+        }
+        launch_kernel(dense_down_type, dev_matrix, ws.d_dense_activated, ws.d_dense_output,
+                      static_cast<int>(hidden), static_cast<int>(dense_size), ws.stream);
+    }
+
+    // 6. Post Dense Norm (RMS Norm) on ws.d_dense_output -> ws.d_dense_output
+    const float* d_post_dense_norm_weight = nullptr;
+    if (post_dense_norm_weight) {
+        auto it = g_cuda_weights.find(post_dense_norm_weight);
+        if (it != g_cuda_weights.end()) d_post_dense_norm_weight = static_cast<const float*>(it->second);
+    }
+    rms_norm_kernel<<<1, 256, 256 * sizeof(float), ws.stream>>>(
+        ws.d_dense_output, d_post_dense_norm_weight, ws.d_dense_output, epsilon, static_cast<int>(hidden));
+
+    // ========================================================================
+    // MoE Expert Path (Executed concurrently with the dense path)
+    // ========================================================================
+    if (num_experts > 0) {
+        // 7. Pre Expert Norm (RMS Norm) on ws.d_vector (host_ffn_input) -> ws.d_moe_input
+        const float* d_pre_expert_norm_weight = nullptr;
+        if (pre_expert_norm_weight) {
+            auto it = g_cuda_weights.find(pre_expert_norm_weight);
+            if (it != g_cuda_weights.end()) d_pre_expert_norm_weight = static_cast<const float*>(it->second);
+        }
+        rms_norm_kernel<<<1, 256, 256 * sizeof(float), ws.stream>>>(
+            ws.d_vector, d_pre_expert_norm_weight, ws.d_moe_input, epsilon, static_cast<int>(hidden));
+
+        // Sync stream to all expert streams so expert matvecs don't run before Pre Expert Norm finishes
+        cudaEventRecord(ws.exp_norm_event, ws.stream);
+        for (std::size_t i = 0; i < num_experts; ++i) {
+            cudaStreamWaitEvent(ws.streams[i], ws.exp_norm_event, 0);
+        }
+
+        // 8. Expert Gate & Up steps (Executed concurrently in streams[0..7])
+        cuda_zero_buffer(ws.d_moe_sum, hidden);
+        cudaMemcpyAsync(ws.d_moe_weights, host_expert_weights, num_experts * sizeof(float), cudaMemcpyHostToDevice, ws.stream);
+
+        for (std::size_t i = 0; i < num_experts; ++i) {
+            auto step = expert_gate_steps[i];
+            std::size_t wbytes = weight_bytes_for(step.type, step.rows, step.cols);
+            void* dev_matrix = nullptr;
+            auto it = g_cuda_weights.find(step.matrix);
+            if (it != g_cuda_weights.end()) {
+                dev_matrix = it->second;
+            } else {
+                ws.ensure(wbytes, 0, 0);
+                cudaMemcpyAsync(ws.d_matrix, step.matrix, wbytes, cudaMemcpyHostToDevice, ws.streams[i]);
+                dev_matrix = ws.d_matrix;
+            }
+            float* d_out = ws.d_moe_gate_up + i * expert_size * 2;
+            launch_kernel(step.type, dev_matrix, ws.d_moe_input, d_out,
+                          static_cast<int>(step.rows), static_cast<int>(step.cols), ws.streams[i]);
+        }
+
+        // Sync all expert streams back to ws.stream before activation
+        for (std::size_t i = 0; i < num_experts; ++i) {
+            cudaEventRecord(ws.expert_events[i], ws.streams[i]);
+            cudaStreamWaitEvent(ws.stream, ws.expert_events[i], 0);
+        }
+
+        // 9. Expert GELU Activation
+        int total_elements = static_cast<int>(expert_size * num_experts);
+        blocks = (total_elements + threads - 1) / threads;
+        gelu_activation_batch_kernel<<<blocks, threads, 0, ws.stream>>>(
+            ws.d_moe_gate_up, ws.d_moe_activated, static_cast<int>(expert_size), static_cast<int>(num_experts));
+
+        // Sync stream to all expert streams so expert down matvecs don't run before activation finishes
+        cudaEventRecord(ws.act_event, ws.stream);
+        for (std::size_t i = 0; i < num_experts; ++i) {
+            cudaStreamWaitEvent(ws.streams[i], ws.act_event, 0);
+        }
+
+        // 10. Expert Down steps (Executed concurrently in streams[0..7])
+        for (std::size_t i = 0; i < num_experts; ++i) {
+            auto step = expert_down_steps[i];
+            std::size_t wbytes = weight_bytes_for(step.type, step.rows, step.cols);
+            void* dev_matrix = nullptr;
+            auto it = g_cuda_weights.find(step.matrix);
+            if (it != g_cuda_weights.end()) {
+                dev_matrix = it->second;
+            } else {
+                ws.ensure(wbytes, 0, 0);
+                cudaMemcpyAsync(ws.d_matrix, step.matrix, wbytes, cudaMemcpyHostToDevice, ws.streams[i]);
+                dev_matrix = ws.d_matrix;
+            }
+            float* d_in = ws.d_moe_activated + i * expert_size;
+            float* d_out = ws.d_moe_output + i * hidden;
+            launch_kernel(step.type, dev_matrix, d_in, d_out,
+                          static_cast<int>(step.rows), static_cast<int>(step.cols), ws.streams[i]);
+        }
+
+        // Sync all expert streams back to ws.stream before accumulate sum
+        for (std::size_t i = 0; i < num_experts; ++i) {
+            cudaEventRecord(ws.expert_events[i], ws.streams[i]);
+            cudaStreamWaitEvent(ws.stream, ws.expert_events[i], 0);
+        }
+
+        // 11. Expert Accumulate Sum
+        blocks = (static_cast<int>(hidden) + threads - 1) / threads;
+        accumulate_sum_batch_kernel<<<blocks, threads, 0, ws.stream>>>(
+            ws.d_moe_output, ws.d_moe_sum, ws.d_moe_weights, static_cast<int>(hidden), static_cast<int>(num_experts));
+
+        // 11.5 Post Expert Norm (RMS Norm) on ws.d_moe_sum -> ws.d_moe_sum
+        const float* d_post_expert_norm_weight = nullptr;
+        if (post_expert_norm_weight) {
+            auto it = g_cuda_weights.find(post_expert_norm_weight);
+            if (it != g_cuda_weights.end()) d_post_expert_norm_weight = static_cast<const float*>(it->second);
+        }
+        rms_norm_kernel<<<1, 256, 256 * sizeof(float), ws.stream>>>(
+            ws.d_moe_sum, d_post_expert_norm_weight, ws.d_moe_sum, epsilon, static_cast<int>(hidden));
+
+        // 12. Combine Dense Output and MoE Sum
+        add_vectors_kernel<<<blocks, threads, 0, ws.stream>>>(
+            ws.d_dense_output, ws.d_moe_sum, ws.d_dense_output, static_cast<int>(hidden));
+    }
+
+    // 13. Download output and sync once
+    std::size_t bytes = hidden * sizeof(float);
+    if (ws.h_pinned_output && ws.pinned_output_capacity >= bytes) {
+        cudaMemcpyAsync(ws.h_pinned_output, ws.d_dense_output, bytes, cudaMemcpyDeviceToHost, ws.stream);
+        cudaStreamSynchronize(ws.stream);
+        memcpy(host_ffn_output, ws.h_pinned_output, bytes);
+    } else {
+        cudaMemcpyAsync(host_ffn_output, ws.d_dense_output, bytes, cudaMemcpyDeviceToHost, ws.stream);
+        cudaStreamSynchronize(ws.stream);
+    }
 }
 
 } // namespace gemmaedge

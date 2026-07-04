@@ -158,31 +158,45 @@ static void parallel_for(std::size_t start, std::size_t end, F&& loop_body) {
     }
 }
 
-float f16_to_f32(std::uint16_t value) noexcept {
-    const std::uint32_t sign = (value & 0x8000u) << 16;
-    std::uint32_t exponent = (value >> 10) & 0x1fu;
-    std::uint32_t mantissa = value & 0x3ffu;
-    std::uint32_t bits;
-    if (exponent == 0) {
-        if (mantissa == 0) {
-            bits = sign;
-        } else {
-            exponent = 1;
-            while ((mantissa & 0x400u) == 0) {
-                mantissa <<= 1;
-                --exponent;
+namespace {
+struct F16ToF32Table {
+    float table[65536];
+    F16ToF32Table() {
+        for (std::uint32_t i = 0; i < 65536; ++i) {
+            std::uint16_t value = static_cast<std::uint16_t>(i);
+            const std::uint32_t sign = (value & 0x8000u) << 16;
+            std::uint32_t exponent = (value >> 10) & 0x1fu;
+            std::uint32_t mantissa = value & 0x3ffu;
+            std::uint32_t bits;
+            if (exponent == 0) {
+                if (mantissa == 0) {
+                    bits = sign;
+                } else {
+                    exponent = 1;
+                    while ((mantissa & 0x400u) == 0) {
+                        mantissa <<= 1;
+                        --exponent;
+                    }
+                    mantissa &= 0x3ffu;
+                    bits = sign | ((exponent + 112u) << 23) | (mantissa << 13);
+                }
+            } else if (exponent == 31) {
+                bits = sign | 0x7f800000u | (mantissa << 13);
+            } else {
+                bits = sign | ((exponent + 112u) << 23) | (mantissa << 13);
             }
-            mantissa &= 0x3ffu;
-            bits = sign | ((exponent + 112u) << 23) | (mantissa << 13);
+            float result;
+            std::memcpy(&result, &bits, sizeof(result));
+            table[i] = result;
         }
-    } else if (exponent == 31) {
-        bits = sign | 0x7f800000u | (mantissa << 13);
-    } else {
-        bits = sign | ((exponent + 112u) << 23) | (mantissa << 13);
     }
-    float result;
-    std::memcpy(&result, &bits, sizeof(result));
-    return result;
+};
+
+const F16ToF32Table g_f16_to_f32_table;
+} // namespace
+
+float f16_to_f32(std::uint16_t value) noexcept {
+    return g_f16_to_f32_table.table[value];
 }
 
 std::uint16_t f32_to_f16(float value) noexcept {
@@ -589,6 +603,8 @@ void ggml_matvec(GgmlType type, const void* matrix, std::size_t rows,
                 for (std::size_t b = 0; b < cols / 32; ++b) {
 #if defined(__ARM_NEON)
                     sum += dot_q8_block_neon(blocks[b], vector + b * 32);
+#elif defined(__AVX2__)
+                    sum += dot_q8_block_avx2(blocks[b], vector + b * 32);
 #else
                     const float d = f16_to_f32(blocks[b].d);
                     for (std::size_t i = 0; i < 32; ++i)

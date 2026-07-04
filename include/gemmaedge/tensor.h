@@ -7,6 +7,12 @@
 #include <utility>
 #include <vector>
 
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#elif defined(__AVX2__)
+#include <immintrin.h>
+#endif
+
 namespace gemmaedge {
 
 constexpr std::size_t kQ4BlockSize = 32;
@@ -25,9 +31,13 @@ struct BlockQ8_0 {
 static_assert(sizeof(Q4Block) == 18, "Q4 block layout must remain stable");
 static_assert(sizeof(BlockQ8_0) == 34, "Q8_0 block layout must remain stable");
 
-#if defined(__ARM_NEON)
-#include <arm_neon.h>
+// Declare float16 helper functions first so inline SIMD functions can use them
+float f16_to_f32(std::uint16_t value) noexcept;
+std::uint16_t f32_to_f16(float value) noexcept;
+float bf16_to_f32(std::uint16_t value) noexcept;
+std::uint16_t f32_to_bf16(float value) noexcept;
 
+#if defined(__ARM_NEON)
 inline float dot_q8_block_neon(const BlockQ8_0& block, const float* x) {
     const float d = f16_to_f32(block.d);
     int8x16_t q0 = vld1q_s8(block.q);
@@ -99,12 +109,67 @@ inline void accumulate_q8_block_neon(const BlockQ8_0& block, float scale_prob, f
     vst1q_f32(dest + 24, vmlaq_f32(vld1q_f32(dest + 24), q1_2, scale_prob_vec));
     vst1q_f32(dest + 28, vmlaq_f32(vld1q_f32(dest + 28), q1_3, scale_prob_vec));
 }
-#endif
+#elif defined(__AVX2__)
+inline float dot_q8_block_avx2(const BlockQ8_0& block, const float* x) {
+    const float d = f16_to_f32(block.d);
+    __m256i q = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(block.q));
+    __m128i q_low = _mm256_castsi256_si128(q);
+    __m128i q_high = _mm256_extracti128_si256(q, 1);
+    
+    __m256i i0 = _mm256_cvtepi8_epi32(q_low);
+    __m256i i1 = _mm256_cvtepi8_epi32(_mm_srli_si128(q_low, 8));
+    __m256i i2 = _mm256_cvtepi8_epi32(q_high);
+    __m256i i3 = _mm256_cvtepi8_epi32(_mm_srli_si128(q_high, 8));
+    
+    __m256 f0 = _mm256_cvtepi32_ps(i0);
+    __m256 f1 = _mm256_cvtepi32_ps(i1);
+    __m256 f2 = _mm256_cvtepi32_ps(i2);
+    __m256 f3 = _mm256_cvtepi32_ps(i3);
+    
+    __m256 x0 = _mm256_loadu_ps(x);
+    __m256 x1 = _mm256_loadu_ps(x + 8);
+    __m256 x2 = _mm256_loadu_ps(x + 16);
+    __m256 x3 = _mm256_loadu_ps(x + 24);
+    
+    __m256 sum0 = _mm256_mul_ps(f0, x0);
+    __m256 sum1 = _mm256_mul_ps(f1, x1);
+    __m256 sum2 = _mm256_mul_ps(f2, x2);
+    __m256 sum3 = _mm256_mul_ps(f3, x3);
+    
+    __m256 total = _mm256_add_ps(_mm256_add_ps(sum0, sum1), _mm256_add_ps(sum2, sum3));
+    
+    __m128 lo = _mm256_castps256_ps128(total);
+    __m128 hi = _mm256_extractf128_ps(total, 1);
+    __m128 s4 = _mm_add_ps(lo, hi);
+    __m128 s2 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));
+    __m128 s1 = _mm_add_ss(s2, _mm_shuffle_ps(s2, s2, 1));
+    float sum = _mm_cvtss_f32(s1);
+    
+    return sum * d;
+}
 
-float f16_to_f32(std::uint16_t value) noexcept;
-std::uint16_t f32_to_f16(float value) noexcept;
-float bf16_to_f32(std::uint16_t value) noexcept;
-std::uint16_t f32_to_bf16(float value) noexcept;
+inline void accumulate_q8_block_avx2(const BlockQ8_0& block, float scale_prob, float* dest) {
+    __m256 scale_vec = _mm256_set1_ps(scale_prob);
+    __m256i q = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(block.q));
+    __m128i q_low = _mm256_castsi256_si128(q);
+    __m128i q_high = _mm256_extracti128_si256(q, 1);
+    
+    __m256i i0 = _mm256_cvtepi8_epi32(q_low);
+    __m256i i1 = _mm256_cvtepi8_epi32(_mm_srli_si128(q_low, 8));
+    __m256i i2 = _mm256_cvtepi8_epi32(q_high);
+    __m256i i3 = _mm256_cvtepi8_epi32(_mm_srli_si128(q_high, 8));
+    
+    __m256 f0 = _mm256_cvtepi32_ps(i0);
+    __m256 f1 = _mm256_cvtepi32_ps(i1);
+    __m256 f2 = _mm256_cvtepi32_ps(i2);
+    __m256 f3 = _mm256_cvtepi32_ps(i3);
+    
+    _mm256_storeu_ps(dest,      _mm256_fmadd_ps(f0, scale_vec, _mm256_loadu_ps(dest)));
+    _mm256_storeu_ps(dest + 8,  _mm256_fmadd_ps(f1, scale_vec, _mm256_loadu_ps(dest + 8)));
+    _mm256_storeu_ps(dest + 16, _mm256_fmadd_ps(f2, scale_vec, _mm256_loadu_ps(dest + 16)));
+    _mm256_storeu_ps(dest + 24, _mm256_fmadd_ps(f3, scale_vec, _mm256_loadu_ps(dest + 24)));
+}
+#endif
 
 Q4Block quantize_q4_block(const float* values);
 void dequantize_q4_block(const Q4Block& block, float* output);

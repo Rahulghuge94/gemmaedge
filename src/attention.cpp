@@ -38,17 +38,26 @@ void apply_rope(float* states, std::size_t head_count, std::size_t head_dim,
         (rotary_dim & 1u) != 0 || frequency_base <= 0.0f)
         throw std::invalid_argument("invalid RoPE arguments");
     const std::size_t half = rotary_dim / 2;
+    if (half > 256) throw std::invalid_argument("rotary_dim too large");
+
+    float cos_vals[256];
+    float sin_vals[256];
+    for (std::size_t i = 0; i < half; ++i) {
+        float frequency =
+            std::pow(frequency_base,
+                     -2.0f * static_cast<float>(i) /
+                         static_cast<float>(rotary_dim));
+        if (frequency_factors) frequency /= frequency_factors[i];
+        const float angle = static_cast<float>(position) * frequency;
+        cos_vals[i] = std::cos(angle);
+        sin_vals[i] = std::sin(angle);
+    }
+
     for (std::size_t head = 0; head < head_count; ++head) {
         float* row = states + head * head_dim;
         for (std::size_t i = 0; i < half; ++i) {
-            float frequency =
-                std::pow(frequency_base,
-                         -2.0f * static_cast<float>(i) /
-                             static_cast<float>(rotary_dim));
-            if (frequency_factors) frequency /= frequency_factors[i];
-            const float angle = static_cast<float>(position) * frequency;
-            const float cosine = std::cos(angle);
-            const float sine = std::sin(angle);
+            const float cosine = cos_vals[i];
+            const float sine = sin_vals[i];
             const float first = row[i];
             const float second = row[i + half];
             row[i] = first * cosine - second * sine;
@@ -118,9 +127,12 @@ void LayerKvCache::attend(const float* queries, float* output) const {
     const std::size_t row_blocks = width / 32;
     const std::size_t group = config_.query_heads / config_.kv_heads;
     const std::size_t blocks_per_head = config_.head_dim / 32;
-    std::vector<float> scores(count_);
 
+    std::vector<float> scores_all(config_.query_heads * count_);
+
+    #pragma omp parallel for schedule(static)
     for (std::size_t qh = 0; qh < config_.query_heads; ++qh) {
+        float* scores = scores_all.data() + qh * count_;
         const std::size_t kvh = qh / group;
         const float* query = queries + qh * config_.head_dim;
         float maximum = -std::numeric_limits<float>::infinity();
@@ -132,6 +144,8 @@ void LayerKvCache::attend(const float* queries, float* output) const {
                 const auto& block = key_row[b];
 #if defined(__ARM_NEON)
                 dot += dot_q8_block_neon(block, query + b * 32);
+#elif defined(__AVX2__)
+                dot += dot_q8_block_avx2(block, query + b * 32);
 #else
                 const float scale = f16_to_f32(block.d);
                 const float* q_block = query + b * 32;
@@ -163,6 +177,8 @@ void LayerKvCache::attend(const float* queries, float* output) const {
                 const float scale_prob = scale * probability;
 #if defined(__ARM_NEON)
                 accumulate_q8_block_neon(block, scale_prob, dest_block);
+#elif defined(__AVX2__)
+                accumulate_q8_block_avx2(block, scale_prob, dest_block);
 #else
                 for (std::size_t i = 0; i < 32; ++i) {
                     dest_block[i] += scale_prob * block.q[i];

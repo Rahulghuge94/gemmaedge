@@ -9,6 +9,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 # Check and enable CUDA optionally
+set(CMAKE_CUDA_ARCHITECTURES 75)
 enable_language(CUDA OPTIONAL)
 
 set(GEMMAEDGE_SOURCES
@@ -35,7 +36,11 @@ else()
     message(STATUS "CUDA compilation disabled, compiling CPU stub.")
 endif()
 
+find_package(OpenMP)
 add_library(gemmaedge_core ${GEMMAEDGE_SOURCES})
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(gemmaedge_core PRIVATE OpenMP::OpenMP_CXX)
+endif()
 if(CMAKE_CUDA_COMPILER)
     set_target_properties(gemmaedge_core PROPERTIES CUDA_STANDARD 17)
     target_compile_definitions(gemmaedge_core PRIVATE GEMMAEDGE_USE_CUDA=1)

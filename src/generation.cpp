@@ -8,6 +8,8 @@
 #include <limits>
 #include <numeric>
 #include <stdexcept>
+#include <iostream>
+#include <cstring>
 
 namespace gemmaedge {
 
@@ -49,6 +51,10 @@ void ScratchArena::resize(const Gemma4Config& config) {
     // Router scratch
     router_norm.resize(hidden);
     router_probs.resize(config.expert_count);
+
+    // Batched evaluation scratch
+    qkv_batch_output.resize(max_query_values + 2 * max_kv_values);
+    ffn_batch_output.resize(dense_size * 2);
 }
 
 TokenId sample_token(const std::vector<float>& logits,
@@ -295,6 +301,13 @@ const std::vector<float>& Gemma4Session::forward(float* hidden, bool skip_logits
     const auto& config = model_.config();
     auto& s = scratch_;
 
+    static double t_qkv = 0;
+    static double t_rope_kv = 0;
+    static double t_attend = 0;
+    static double t_att_proj = 0;
+    static double t_ffn = 0;
+    static int forward_count = 0;
+
     const float* global_factors = nullptr;
     if (model_.rope_frequencies())
         global_factors = f32_data(*model_.rope_frequencies());
@@ -308,22 +321,46 @@ const std::vector<float>& Gemma4Session::forward(float* hidden, bool skip_logits
         const std::size_t kv_values =
             static_cast<std::size_t>(config.kv_heads[layer_index]) * head_dim;
 
+        auto t0 = std::chrono::steady_clock::now();
         rms_norm(hidden, f32_data(*layer.attention_norm), config.hidden_size,
                  config.rms_epsilon, s.normalized.data());
 
         // Upload normalized input once; Q, K, V projections share it
         if (is_cuda_available()) {
             upload_input(s.normalized.data(), config.hidden_size);
-            matvec_device_vec(*layer.q, s.normalized.data(), s.q.data());
-            matvec_device_vec(*layer.k, s.normalized.data(), s.k.data());
-            if (layer.v) matvec_device_vec(*layer.v, s.normalized.data(), s.v.data());
-            else std::copy(s.k.data(), s.k.data() + kv_values, s.v.data());
+            const std::size_t q_rows = config.attention_heads * head_dim;
+            const std::size_t k_rows = config.kv_heads[layer_index] * head_dim;
+            const std::size_t v_rows = layer.v ? (config.kv_heads[layer_index] * head_dim) : 0;
+            const std::size_t total_out_elems = q_rows + k_rows + (layer.v ? v_rows : 0);
+            
+            std::vector<CudaMatvecStep> steps;
+            steps.reserve(3);
+            steps.push_back({layer.q->type, tensor_data(*layer.q), 0, q_rows, config.hidden_size});
+            steps.push_back({layer.k->type, tensor_data(*layer.k), q_rows, k_rows, config.hidden_size});
+            if (layer.v) {
+                steps.push_back({layer.v->type, tensor_data(*layer.v), q_rows + k_rows, v_rows, config.hidden_size});
+            }
+            
+            cuda_matvec_batch(steps, cuda_get_vector_buf(), total_out_elems);
+            
+            float* d_output_base = cuda_get_output_buf();
+            cuda_download_vector_from(s.qkv_batch_output.data(), d_output_base, total_out_elems);
+            
+            std::memcpy(s.q.data(), s.qkv_batch_output.data(), q_rows * sizeof(float));
+            std::memcpy(s.k.data(), s.qkv_batch_output.data() + q_rows, k_rows * sizeof(float));
+            if (layer.v) {
+                std::memcpy(s.v.data(), s.qkv_batch_output.data() + q_rows + k_rows, v_rows * sizeof(float));
+            } else {
+                std::copy(s.k.data(), s.k.data() + kv_values, s.v.data());
+            }
         } else {
             matvec(*layer.q, s.normalized.data(), s.q.data());
             matvec(*layer.k, s.normalized.data(), s.k.data());
             if (layer.v) matvec(*layer.v, s.normalized.data(), s.v.data());
             else std::copy(s.k.data(), s.k.data() + kv_values, s.v.data());
         }
+        auto t1 = std::chrono::steady_clock::now();
+        t_qkv += std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
 
         for (std::uint32_t head = 0; head < config.attention_heads; ++head)
             rms_norm(s.q.data() + static_cast<std::size_t>(head) * head_dim,
@@ -347,7 +384,13 @@ const std::vector<float>& Gemma4Session::forward(float* hidden, bool skip_logits
         apply_rope(s.k.data(), config.kv_heads[layer_index], head_dim, head_dim,
                    position_, rope_base, factors);
         kv_[layer_index]->append(position_, s.k.data(), s.v.data());
+        auto t2 = std::chrono::steady_clock::now();
+        t_rope_kv += std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
+
         kv_[layer_index]->attend(s.q.data(), s.attended.data());
+        auto t3 = std::chrono::steady_clock::now();
+        t_attend += std::chrono::duration_cast<std::chrono::microseconds>(t3 - t2).count();
+
         if (is_cuda_available()) {
             upload_input(s.attended.data(), config.attention_heads * head_dim);
             matvec_device_vec(*layer.attention_output, s.attended.data(), s.projected.data());
@@ -358,8 +401,22 @@ const std::vector<float>& Gemma4Session::forward(float* hidden, bool skip_logits
                  config.hidden_size, config.rms_epsilon, s.projected.data());
         for (std::size_t i = 0; i < config.hidden_size; ++i)
             s.layer_output[i] = hidden[i] + s.projected[i];
+        auto t4 = std::chrono::steady_clock::now();
+        t_att_proj += std::chrono::duration_cast<std::chrono::microseconds>(t4 - t3).count();
 
         feed_forward_.forward(layer_index, s.layer_output.data(), hidden, s);
+        auto t5 = std::chrono::steady_clock::now();
+        t_ffn += std::chrono::duration_cast<std::chrono::microseconds>(t5 - t4).count();
+    }
+
+    forward_count++;
+    if (forward_count % 10 == 0) {
+        std::cout << "\n[Profile after " << forward_count << " steps] "
+                  << "t_qkv: " << t_qkv / forward_count / 1000.0 << " ms/step, "
+                  << "t_rope_kv: " << t_rope_kv / forward_count / 1000.0 << " ms/step, "
+                  << "t_attend: " << t_attend / forward_count / 1000.0 << " ms/step, "
+                  << "t_att_proj: " << t_att_proj / forward_count / 1000.0 << " ms/step, "
+                  << "t_ffn: " << t_ffn / forward_count / 1000.0 << " ms/step" << std::endl;
     }
 
     if (!skip_logits) {
@@ -372,9 +429,11 @@ const std::vector<float>& Gemma4Session::forward(float* hidden, bool skip_logits
             matvec(model_.output(), s.normalized.data(), logits_.data());
         }
         if (config.final_logit_softcap > 0.0f) {
-            for (float& logit : logits_)
-                logit = config.final_logit_softcap *
-                        std::tanh(logit / config.final_logit_softcap);
+            const float softcap = config.final_logit_softcap;
+            #pragma omp parallel for
+            for (std::size_t i = 0; i < logits_.size(); ++i) {
+                logits_[i] = softcap * std::tanh(logits_[i] / softcap);
+            }
         }
     }
     ++position_;

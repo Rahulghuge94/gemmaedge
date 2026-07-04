@@ -45,6 +45,10 @@ struct ScratchArena {
     std::vector<float> router_norm;
     std::vector<float> router_probs;
 
+    // Batched evaluation scratch
+    std::vector<float> qkv_batch_output;
+    std::vector<float> ffn_batch_output;
+
     void resize(const Gemma4Config& config);
 };
 

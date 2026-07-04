@@ -51,6 +51,8 @@ public:
         return expert_cache_.stats();
     }
 
+    void preload_all_experts();
+
 private:
     ExpertView load_expert(const ExpertKey& key) const;
     const std::uint8_t* tensor_data(const GgufTensor& tensor) const;
